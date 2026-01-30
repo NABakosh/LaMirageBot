@@ -1,0 +1,26 @@
+# WhatsApp Bot для салона красоты La Mirage Beauty
+# Python версия - зависимости
+
+# Core dependencies
+python-dotenv>=1.0.0
+psycopg2-binary>=2.9.9
+
+# Google Cloud AI
+google-cloud-aiplatform>=1.38.1
+vertexai>=1.0.0
+
+# Google Calendar API
+google-auth>=2.25.2
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+google-api-python-client>=2.111.0
+
+# Scheduling
+schedule>=1.2.0
+
+# QR Code generation
+qrcode[pil]>=7.4.2
+Pillow>=10.4.0
+
+# WhatsApp Web client
+whatsapp-web.py>=0.1.0

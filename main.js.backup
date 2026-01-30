@@ -1074,7 +1074,10 @@ async function handleMessage(msg, sock) {
 	// Получение состояния разговора
 	let conversation = await getConversation(userId)
 
-	// Проверка fromMe и групп теперь в initWhatsApp()
+	// Игнорируем сообщения от ботов и групп
+	if (message.fromMe || message.from.includes('@g.us')) {
+		return
+	}
 
 	// ===================== ПРОВЕРКА ИСТЕЧЕНИЯ СЕССИИ =====================
 	if (conversation) {
@@ -1105,26 +1108,26 @@ async function handleMessage(msg, sock) {
 		console.log(`👤 Admin call detected from ${userId}: ${userMessage}`)
 
 		if (userMessage === '/admin') {
-			return await sendAdminStats(msg, sock)
+			return await sendAdminStats(message)
 		}
 
 		if (userMessage === '/dashboard') {
-			return await sendDashboardLink(msg, sock)
+			return await sendDashboardLink(message)
 		}
 
 		if (userMessage.match(/^\/ok\s+\d+$/)) {
-			return await confirmBooking(msg, sock, userMessage)
+			return await confirmBooking(message, userMessage)
 		}
 
 		if (userMessage.match(/^\/no\s+\d+$/)) {
-			return await rejectBooking(msg, sock, userMessage)
+			return await rejectBooking(message, userMessage)
 		}
 
 		// Подключение к чату с клиентом
 		if (userMessage.startsWith('/connect')) {
 			const phoneInput = userMessage.split(' ')[1]
 			if (!phoneInput)
-				return await replyMessage(sock, msg, '❌ Укажите номер: /connect 7701...')
+				return await message.reply('❌ Укажите номер: /connect 7701...')
 			const phoneToConnect = phoneInput.replace(/[^0-9]/g, '')
 
 			try {
@@ -1149,7 +1152,7 @@ async function handleMessage(msg, sock) {
 				}
 
 				if (!targetUserId)
-					return await replyMessage(sock, msg, 
+					return await message.reply(
 						'❌ Клиент с таким номером не найден (или нет активного диалога).'
 					)
 
@@ -1169,19 +1172,19 @@ async function handleMessage(msg, sock) {
 					)
 
 					if (updateRes2.rowCount === 0) {
-						return await replyMessage(sock, msg, 
+						return await message.reply(
 							`❌ Ошибка: Не удалось обновить статус диалога. ID: ${targetUserId}`
 						)
 					}
 					targetUserId = altUserId
 				}
 
-				return await replyMessage(sock, msg, 
+				return await message.reply(
 					`✅ Режим оператора включен для ${phoneToConnect}.\nID: ${targetUserId}\nВсе сообщения пересылаются.`
 				)
 			} catch (e) {
 				console.error(e)
-				return await replyMessage(sock, msg, 'Ошибка: ' + e.message)
+				return await message.reply('Ошибка: ' + e.message)
 			}
 		}
 
@@ -1199,13 +1202,13 @@ async function handleMessage(msg, sock) {
 						'UPDATE conversations SET is_admin_mode = FALSE, admin_chat_id = NULL WHERE user_id = $1',
 						[clientUserId]
 					)
-					await sendMessage(sock, 
+					await whatsappClient.sendMessage(
 						clientUserId,
 						'👩‍💻 Оператор завершил диалог. Я снова с вами! Чем могу помочь?'
 					)
-					return await replyMessage(sock, msg, `✅ Диалог завершен. AI снова включен.`)
+					return await message.reply(`✅ Диалог завершен. AI снова включен.`)
 				} else {
-					return await replyMessage(sock, msg, '❌ У вас нет активных диалогов')
+					return await message.reply('❌ У вас нет активных диалогов')
 				}
 			} catch (e) {
 				console.error(e)
@@ -1220,7 +1223,7 @@ async function handleMessage(msg, sock) {
 			)
 			if (res.rows.length > 0) {
 				const clientUserId = res.rows[0].user_id
-				await sendMessage(sock, 
+				await whatsappClient.sendMessage(
 					clientUserId,
 					`👩‍💻 Администратор: ${userMessage}`
 				)
@@ -1240,7 +1243,7 @@ async function handleMessage(msg, sock) {
 			console.log(
 				`⚠️ Попытка использовать админскую команду от не-админа ${userId}`
 			)
-			return await replyMessage(sock, msg, 
+			return await message.reply(
 				'❌ У вас нет прав администратора. Проверьте консоль.'
 			)
 		}
@@ -1252,13 +1255,13 @@ async function handleMessage(msg, sock) {
 		userMessage.toLowerCase().includes('админ') ||
 		userMessage.toLowerCase().includes('менеджер')
 	) {
-		await replyMessage(sock, msg, 'Передала ваш запрос менеджерам! 👩‍💻 Скоро ответим.')
+		await message.reply('Передала ваш запрос менеджерам! 👩‍💻 Скоро ответим.')
 
 		for (const adminId of CONFIG.ADMIN_WHITELIST) {
 			const cleanPhone = conversation
 				? conversation.client_phone
 				: userId.replace('@c.us', '')
-			await sendMessage(sock, 
+			await whatsappClient.sendMessage(
 				adminId,
 				`🔔 Клиент просит оператора!\nИмя: ${conversation?.client_name}\nТелефон: ${cleanPhone}\n\nПодключиться: /connect ${cleanPhone}`
 			)
@@ -1276,12 +1279,12 @@ async function handleMessage(msg, sock) {
 		if (conversation) {
 			conversation.client_name = newName
 			if (!conversation.client_phone) {
-				conversation.client_phone = await extractPhoneNumber(userId)
+				conversation.client_phone = await extractPhoneNumber(userId, message)
 			}
 			await saveConversation(conversation)
 			await saveClient(conversation.client_phone, newName, userId)
 
-			return await replyMessage(sock, msg, 
+			return await message.reply(
 				`✅ Ваше имя обновлено: ${newName}\n\nТеперь я буду обращаться к вам так! 🤍`
 			)
 		}
@@ -1297,7 +1300,7 @@ async function handleMessage(msg, sock) {
 
 			if ((!phone || phoneLooksLikeLid) && isLidUser) {
 				try {
-					const extractedId = await extractPhoneNumber(userId)
+					const extractedId = await extractPhoneNumber(userId, message)
 					const searchId = extractedId + '@c.us'
 
 					const result = await pool.query(
@@ -1315,10 +1318,10 @@ async function handleMessage(msg, sock) {
 			}
 
 			if (!phone) {
-				phone = await extractPhoneNumber(userId)
+				phone = await extractPhoneNumber(userId, message)
 			}
 
-			return await replyMessage(sock, msg, 
+			return await message.reply(
 				`👤 ВАШИ ДАННЫЕ:\n\n` +
 					`Имя: ${conversation.client_name || 'не указано'}\n` +
 					`Телефон: ${phone}\n\n` +
@@ -1373,7 +1376,7 @@ async function handleMessage(msg, sock) {
 
 			console.log(`🔄 Восстановлена сессия для ${existingClient.name} (${existingClient.phone})`)
 			
-			return await replyMessage(sock, msg, 
+			return await message.reply(
 				`Здравствуйте, ${existingClient.name}! 👋\nРада снова вас видеть в ${CONFIG.SALON_NAME} ✨\n\nЧем могу помочь?\n\n💅 Маникюр\n👁 Брови и ресницы\n🌸 Шугаринг`
 			)
 		}
@@ -1385,11 +1388,11 @@ async function handleMessage(msg, sock) {
 			history: [],
 			booking_data: {},
 			client_name: null,
-			client_phone: await extractPhoneNumber(userId),
+			client_phone: await extractPhoneNumber(userId, message),
 		}
 		await saveConversation(conversation)
 
-		return await replyMessage(sock, msg, 
+		return await message.reply(
 			`Здравствуйте! ❤️\nДобро пожаловать в салон красоты ${CONFIG.SALON_NAME} ✨\n\nКак мне к вам обращаться?\nНапишите, пожалуйста, ваше имя и номер телефона 🤍`
 		)
 	}
@@ -1399,7 +1402,7 @@ async function handleMessage(msg, sock) {
 		const nameValidation = await validateUserDataWithGemini(userMessage, 'name')
 
 		if (!nameValidation.isValid) {
-			return await replyMessage(sock, msg, 
+			return await message.reply(
 				`${nameValidation.message}\n\n💡 Напишите, пожалуйста, ваше имя и номер телефона`
 			)
 		}
@@ -1410,7 +1413,7 @@ async function handleMessage(msg, sock) {
 			'phone'
 		)
 
-		const extractedPhone = await extractPhoneNumber(userId)
+		const extractedPhone = await extractPhoneNumber(userId, message)
 		const isLidUser = userId.includes('@lid')
 
 		let finalPhone = null
@@ -1428,7 +1431,7 @@ async function handleMessage(msg, sock) {
 			conversation.stage = 'asking_phone_only'
 			await saveConversation(conversation)
 
-			return await replyMessage(sock, msg, 
+			return await message.reply(
 				`Приятно познакомиться, ${cleanName}! ✨\n\nТеперь напишите, пожалуйста, ваш номер телефона 📱`
 			)
 		}
@@ -1439,7 +1442,7 @@ async function handleMessage(msg, sock) {
 		await saveConversation(conversation)
 		await saveClient(finalPhone, cleanName, userId)
 
-		return await replyMessage(sock, msg, 
+		return await message.reply(
 			`Отлично, ${cleanName}! Все данные сохранены ✅\n\nЯ помогу вам записаться на услугу. Расскажите, что вас интересует? Или выберите:\n\n💅 Маникюр\n👁 Брови и ресницы\n🌸 Шугаринг`
 		)
 	}
@@ -1452,7 +1455,7 @@ async function handleMessage(msg, sock) {
 		)
 
 		if (!phoneValidation.isValid) {
-			return await replyMessage(sock, msg, phoneValidation.message)
+			return await message.reply(phoneValidation.message)
 		}
 
 		conversation.client_phone = phoneValidation.data
@@ -1464,7 +1467,7 @@ async function handleMessage(msg, sock) {
 			userId
 		)
 
-		return await replyMessage(sock, msg, 
+		return await message.reply(
 			`Отлично, ${conversation.client_name}! Номер сохранен ✅\n\nТеперь расскажите, что вас интересует?\n\n💅 Маникюр\n👁 Брови и ресницы\n🌸 Шугаринг\n\nКакой мастер вам удобен и когда вы хотели бы прийти?`
 		)
 	}
@@ -1472,7 +1475,7 @@ async function handleMessage(msg, sock) {
 	// Режим оператора
 	if (conversation.is_admin_mode && conversation.admin_chat_id) {
 		try {
-			await sendMessage(sock, 
+			await whatsappClient.sendMessage(
 				conversation.admin_chat_id,
 				`👤 Клиент ${
 					conversation.client_name || conversation.client_phone
@@ -1502,7 +1505,7 @@ async function handleMessage(msg, sock) {
 	await saveConversation(conversation)
 
 	// Генерация ответа
-	await generateAndSendResponse(msg, conversation, sock)
+	await generateAndSendResponse(message, conversation)
 }
 
 // Получение разговора из БД
@@ -1612,7 +1615,7 @@ async function resetSession(userId, silent = false) {
 // Уведомление о завершении сессии (только когда нужно)
 async function notifySessionExpired(userId) {
 	try {
-		await sendMessage(sock, 
+		await whatsappClient.sendMessage(
 			userId,
 			`⏰ Ваша сессия завершена из-за неактивности.\n\nЕсли хотите продолжить - просто напишите мне снова! 🤍\n\nЯ буду рада помочь вам! ✨`
 		)
@@ -1649,7 +1652,7 @@ async function resetSession(userId) {
 // Уведомление о завершении сессии
 async function notifySessionExpired(userId) {
 	try {
-		await sendMessage(sock, 
+		await whatsappClient.sendMessage(
 			userId,
 			`⏰ Ваша сессия завершена из-за неактивности.\n\nЕсли хотите продолжить - просто напишите мне снова! 🤍\n\nЯ буду рада помочь вам! ✨`
 		)
@@ -1685,13 +1688,13 @@ async function saveClient(phone, name, userId) {
 
 // Отправка ссылки на dashboard
 // Отправка ссылки на dashboard
-async function sendDashboardLink(msg, sock) {
-	await replyMessage(sock, msg, 
+async function sendDashboardLink(message) {
+	await message.reply(
 		`📊 Dashboard салона La Mirage Beauty\n\n🌐 Откройте в браузере:\nhttp://localhost:3000\n\nЧтобы запустить dashboard, выполните в терминале:\nnpm run dashboard`
 	)
 }
 // Отправка приветствия
-async function sendGreeting(msg, sock) {
+async function sendGreeting(message) {
 	const greeting = `Здравствуйте!❤️
 Вас приветствует салон красоты ${CONFIG.SALON_NAME} ✨
 Очень рада вашему обращению!🫶
@@ -1704,11 +1707,11 @@ async function sendGreeting(msg, sock) {
 Я с радостью помогу вам с записью ✨
 Спасибо, что выбираете ${CONFIG.SALON_NAME} 🤍`
 
-	await replyMessage(sock, msg, greeting)
+	await message.reply(greeting)
 }
 
 // Генерация ответа с Gemini AI
-async function generateAndSendResponse(msg, conversation, sock) {
+async function generateAndSendResponse(message, conversation) {
 	try {
 		const systemPrompt = createSystemPrompt(conversation.client_name)
 		const chatHistory = conversation.history.slice(-10).map(msg => ({
@@ -1725,7 +1728,7 @@ ${chatHistory
 	.join('\n')}
 
 НОВОЕ СООБЩЕНИЕ КЛИЕНТА:
-${conversation.history[conversation.history.length - 1]?.content || ''}
+${message.body}
 
 ТВОЙ ОТВЕТ:`
 
@@ -1816,7 +1819,7 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 				})
 				await saveConversation(conversation)
 
-				return await replyMessage(sock, msg, response)
+				return await message.reply(response)
 			} else {
 				// Время СВОБОДНО - убираем команду, продолжаем запись
 				console.log(
@@ -1840,8 +1843,7 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 		if (bookingIntent.ready) {
 			console.log(`📋 Все данные собраны, создаём запись...`)
 			await initiateBookingConfirmation(
-				msg,
-				sock,
+				message,
 				conversation,
 				bookingIntent.data
 			)
@@ -1870,12 +1872,11 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 				busyMessage += `\n\nК сожалению, на эту дату все занято. Попробуйте другой день! 🤍`
 			}
 
-			await replyMessage(sock, msg, busyMessage)
+			await message.reply(busyMessage)
 		} else {
 			// Детекция отмены
-			const lastUserMessage = conversation.history[conversation.history.length - 1]?.content || ''
-			if (await detectCancellation(conversation.user_id, lastUserMessage, sock)) {
-				await replyMessage(sock, msg, 
+			if (await detectCancellation(conversation.user_id, message.body)) {
+				await message.reply(
 					'Хорошо, я отменила вашу последнюю активную запись/заявку. 👌\n\nЕсли захотите записаться снова — просто напишите!'
 				)
 				conversation.booking_data = {}
@@ -1884,12 +1885,12 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 			}
 
 			// Обычный ответ
-			await replyMessage(sock, msg, response)
+			await message.reply(response)
 		}
 	} catch (error) {
 		console.error('Ошибка Gemini AI:', error)
 		console.error('Детали ошибки:', error.stack)
-		await replyMessage(sock, msg, 
+		await message.reply(
 			'Извините, произошла техническая ошибка. Попробуйте еще раз или позвоните нам.'
 		)
 	}
@@ -2047,6 +2048,7 @@ ${nextDays}
 Веди диалог тепло и с заботой о клиенте! ❤️`
 }
 
+// Определение намерения записаться
 // ===================== ОПРЕДЕЛЕНИЕ НАМЕРЕНИЯ С УМНЫМИ ДАТАМИ =====================
 async function detectBookingIntent(conversation) {
 	const recentMessages = conversation.history
@@ -2204,21 +2206,6 @@ async function checkAvailability(masterName, date, time, durationMinutes = 60) {
 			checkTime = time.substring(0, 5)
 		}
 
-		// Проверка на прошедшее время
-		// Нормализация даты для проверки
-		let dateStr = date
-		if (date instanceof Date) {
-			dateStr = date.toISOString().split('T')[0]
-		}
-		
-		const bookingDateTime = new Date(`${dateStr}T${checkTime}:00`)
-		const now = new Date()
-		
-		if (bookingDateTime < now) {
-			console.log(`⛔ Попытка записи на прошедшее время: ${dateStr} ${checkTime}`)
-			return false
-		}
-
 		// SQL для поиска пересечений с учетом длительности услуги
 		// Проверяем записи со статусом 'confirmed' и 'pending'
 		const result = await pool.query(
@@ -2299,20 +2286,19 @@ async function getAvailableSlots(masterName, date) {
 	}
 }
 // Инициация подтверждения записи
-async function initiateBookingConfirmation(msg, sock, conversation, bookingData) {
-	const userId = msg.key.remoteJid
+async function initiateBookingConfirmation(message, conversation, bookingData) {
 	// 1. Rate Limiting: Проверка на спам (не более 5 записей в час)
 	try {
 		const rateLimitCheck = await pool.query(
 			`SELECT COUNT(*) FROM bookings 
 			WHERE user_id = $1 
 			AND created_at > NOW() - INTERVAL '1 hour'`,
-			[userId]
+			[message.from]
 		)
 
 		if (parseInt(rateLimitCheck.rows[0].count) >= 5) {
-			console.log(`⛔ Rate limit exceeded for ${userId}`)
-			return await replyMessage(sock, msg, 
+			console.log(`⛔ Rate limit exceeded for ${message.from}`)
+			return await message.reply(
 				'⚠️ Вы создали слишком много заявок за последний час. Пожалуйста, подождите немного.'
 			)
 		}
@@ -2323,7 +2309,7 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 	// Используем сохраненный телефон из разговора, если есть
 	const clientPhone =
 		conversation.client_phone ||
-		(await extractPhoneNumber(userId))
+		(await extractPhoneNumber(message.from, message))
 
 	// Используем имя из conversation, если нет - пытаемся получить из БД
 	let clientName = conversation.client_name
@@ -2395,7 +2381,7 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 				alternativeMessage += `\n\nК сожалению, на эту дату все занято. Попробуйте выбрать другой день! 🤍`
 			}
 
-			return await replyMessage(sock, msg, alternativeMessage)
+			return await message.reply(alternativeMessage)
 		}
 
 		// Создаем запись с длительностью
@@ -2404,7 +2390,7 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
       RETURNING id`,
 			[
-				userId,
+				message.from,
 				clientName,
 				clientPhone,
 				bookingData.service,
@@ -2439,7 +2425,7 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 		// Уведомление клиента
 		// Уведомление клиента (КРАТКОЕ)
 		// Уведомление клиента
-		await replyMessage(sock, msg, 
+		await message.reply(
 			`Отлично, ${clientName}! Я отправила ваш запрос администратору ✨\n\nДетали записи:\n📋 Услуга: ${
 				bookingData.service
 			}\n👤 Мастер: ${bookingData.master}\n💰 Цена: ${
@@ -2452,13 +2438,13 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 		)
 
 		// Уведомление админов
-		await notifyAdmins(sock, bookingId)
+		await notifyAdmins(bookingId)
 
 		console.log(`✅ Создана запись #${bookingId} для ${clientName}`)
 	} catch (error) {
 		console.error('Ошибка создания записи:', error)
 		console.error('Детали ошибки:', error.stack)
-		await replyMessage(sock, msg, 
+		await message.reply(
 			'Произошла ошибка при создании записи. Пожалуйста, попробуйте еще раз или свяжитесь с администратором.'
 		)
 	}
@@ -2466,7 +2452,7 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 
 // Уведомление администраторов
 // Уведомление администраторов
-async function notifyAdmins(sock, bookingId) {
+async function notifyAdmins(bookingId) {
 	try {
 		const result = await pool.query('SELECT * FROM bookings WHERE id = $1', [
 			bookingId,
@@ -2514,7 +2500,7 @@ async function notifyAdmins(sock, bookingId) {
 
 		for (const adminId of CONFIG.ADMIN_WHITELIST) {
 			try {
-				await sendMessage(sock, adminId, adminMessage)
+				await whatsappClient.sendMessage(adminId, adminMessage)
 				console.log(`✅ Уведомление отправлено админу: ${adminId}`)
 			} catch (error) {
 				console.error(`❌ Ошибка отправки админу ${adminId}:`, error)
@@ -2527,7 +2513,7 @@ async function notifyAdmins(sock, bookingId) {
 
 // Функция детекции отмены
 // Функция детекции отмены
-async function detectCancellation(userId, messageText, sock) {
+async function detectCancellation(userId, messageText) {
 	const lower = messageText.toLowerCase().trim()
 
 	// Ключевые слова отмены
@@ -2570,7 +2556,7 @@ async function detectCancellation(userId, messageText, sock) {
 
 				// Уведомляем админов если запись была подтверждена
 				if (booking.status === 'confirmed') {
-					await notifyAdminsCancellation(sock, booking.id, booking)
+					await notifyAdminsCancellation(booking.id, booking)
 				}
 
 				return true
@@ -2590,10 +2576,10 @@ async function detectCancellation(userId, messageText, sock) {
 }
 
 // Уведомление об отмене (улучшенное)
-async function notifyAdminsCancellation(sock, bookingId, booking) {
+async function notifyAdminsCancellation(bookingId, booking) {
 	for (const adminId of CONFIG.ADMIN_WHITELIST) {
 		try {
-			await sendMessage(sock, 
+			await whatsappClient.sendMessage(
 				adminId,
 				`⚠️ ОТМЕНА ЗАПИСИ #${bookingId}\n\nКлиент отменил подтвержденную запись:\n📋 ${booking.service}\n📅 ${booking.date}\n🕐 ${booking.time}`
 			)
@@ -2603,10 +2589,20 @@ async function notifyAdminsCancellation(sock, bookingId, booking) {
 	}
 }
 
-
+// Уведомление об отмене
+async function notifyAdminsCancellation(bookingId) {
+	for (const adminId of CONFIG.ADMIN_WHITELIST) {
+		try {
+			await whatsappClient.sendMessage(
+				adminId,
+				`⚠️ Клиент отменил запись #${bookingId}!`
+			)
+		} catch (e) {}
+	}
+}
 
 // Обработка ответа администратора
-async function confirmBooking(msg, sock, command) {
+async function confirmBooking(message, command) {
 	const bookingId = command.split(' ')[1]
 
 	try {
@@ -2616,15 +2612,15 @@ async function confirmBooking(msg, sock, command) {
 		const booking = result.rows[0]
 
 		if (!booking) {
-			return await replyMessage(sock, msg, '❌ Запись не найдена')
+			return await message.reply('❌ Запись не найдена')
 		}
 
 		if (booking.status === 'confirmed') {
-			return await replyMessage(sock, msg, `⚠️ Запись #${bookingId} уже подтверждена`)
+			return await message.reply(`⚠️ Запись #${bookingId} уже подтверждена`)
 		}
 
 		if (booking.status === 'rejected') {
-			return await replyMessage(sock, msg, `⚠️ Запись #${bookingId} была отклонена`)
+			return await message.reply(`⚠️ Запись #${bookingId} была отклонена`)
 		}
 
 		await pool.query(
@@ -2633,7 +2629,7 @@ async function confirmBooking(msg, sock, command) {
 		)
 
 		// Сразу отвечаем админу, чтобы не ждать остальные операции
-		await replyMessage(sock, msg, 
+		await message.reply(
 			`✅ Запись #${bookingId} подтверждена\nКлиент ${booking.client_name} уведомлен`
 		)
 
@@ -2664,7 +2660,7 @@ async function confirmBooking(msg, sock, command) {
 			formattedTime = formattedTime.substring(0, 5)
 		}
 
-		await sendMessage(sock, 
+		await whatsappClient.sendMessage(
 			booking.user_id,
 			`✅ Ваша запись подтверждена!\n\n📋 ${booking.service}\n👤 Мастер: ${booking.master}\n💰 ${booking.price} тг\n📅 ${formattedDate}\n🕐 ${formattedTime}\n\nЖдем вас в ${CONFIG.SALON_NAME}! ✨`
 		)
@@ -2685,11 +2681,11 @@ async function confirmBooking(msg, sock, command) {
 		}
 	} catch (error) {
 		console.error('Ошибка подтверждения:', error)
-		await replyMessage(sock, msg, 'Произошла ошибка при подтверждении')
+		await message.reply('Произошла ошибка при подтверждении')
 	}
 }
 
-async function rejectBooking(msg, sock, command) {
+async function rejectBooking(message, command) {
 	const bookingId = command.split(' ')[1]
 
 	try {
@@ -2699,15 +2695,15 @@ async function rejectBooking(msg, sock, command) {
 		const booking = result.rows[0]
 
 		if (!booking) {
-			return await replyMessage(sock, msg, '❌ Запись не найдена')
+			return await message.reply('❌ Запись не найдена')
 		}
 
 		if (booking.status === 'confirmed') {
-			return await replyMessage(sock, msg, `⚠️ Запись #${bookingId} уже подтверждена`)
+			return await message.reply(`⚠️ Запись #${bookingId} уже подтверждена`)
 		}
 
 		if (booking.status === 'rejected') {
-			return await replyMessage(sock, msg, `⚠️ Запись #${bookingId} уже отклонена`)
+			return await message.reply(`⚠️ Запись #${bookingId} уже отклонена`)
 		}
 
 		await pool.query('UPDATE bookings SET status = $1 WHERE id = $2', [
@@ -2716,19 +2712,19 @@ async function rejectBooking(msg, sock, command) {
 		])
 
 		// Сразу отвечаем админу
-		await replyMessage(sock, msg, 
+		await message.reply(
 			`❌ Запись #${bookingId} отклонена\nКлиент ${booking.client_name} уведомлен`
 		)
 
 		// Уведомление клиента
 		// Уведомление клиента
-		await sendMessage(sock, 
+		await whatsappClient.sendMessage(
 			booking.user_id,
 			`К сожалению, не можем подтвердить запись на это время 😔\n\nПожалуйста, выберите другое время! Напишите нам снова 🤍`
 		)
 	} catch (error) {
 		console.error('Ошибка отклонения:', error)
-		await replyMessage(sock, msg, 'Произошла ошибка при отклонении')
+		await message.reply('Произошла ошибка при отклонении')
 	}
 }
 
@@ -2828,7 +2824,7 @@ async function updateStatistics(booking) {
 }
 
 // Отправка статистики
-async function sendAdminStats(msg, sock) {
+async function sendAdminStats(message) {
 	try {
 		const result = await pool.query(
 			'SELECT * FROM statistics ORDER BY revenue DESC'
@@ -2861,10 +2857,10 @@ async function sendAdminStats(msg, sock) {
 		statsText += `Общий доход: ${totalRevenue.toLocaleString()} тг\n`
 		statsText += `Активных диалогов: ${conversationsCount.rows[0].count}`
 
-		await replyMessage(sock, msg, statsText)
+		await message.reply(statsText)
 	} catch (error) {
 		console.error('Ошибка получения статистики:', error)
-		await replyMessage(sock, msg, 'Ошибка получения статистики')
+		await message.reply('Ошибка получения статистики')
 	}
 }
 function startReminderScheduler() {
@@ -2894,7 +2890,7 @@ function startReminderScheduler() {
 
 			for (const booking of result.rows) {
 				try {
-					await sendMessage(sock, 
+					await whatsappClient.sendMessage(
 						booking.user_id,
 						`⏰ НАПОМИНАНИЕ О ЗАПИСИ\n\nЗдравствуйте, ${booking.client_name}!\n\nНапоминаем, что сегодня в ${booking.time} у вас запись:\n\n📋 ${booking.service}\n👤 Мастер: ${booking.master}\n📍 Адрес: ${CONFIG.SALON_ADDRESS}\n\nЖдём вас! ✨`
 					)
@@ -2979,19 +2975,14 @@ async function startBot() {
 if (CONFIG.NODE_ENV !== 'test' && require.main === module) {
 	startBot().catch(console.error)
 }
-// Обработка выхода
+
 process.on('SIGINT', async () => {
 	console.log('\n👋 Остановка бота...')
-	try {
-		if (whatsappClient && typeof whatsappClient.end === 'function') {
-			await whatsappClient.end()
-		}
-		if (pool) await pool.end()
-		process.exit(0)
-	} catch (error) {
-		console.error('Ошибка при остановке:', error.message)
-		process.exit(1)
+	if (whatsappClient) {
+		await whatsappClient.destroy()
 	}
+	await pool.end()
+	process.exit(0)
 })
 
 module.exports = {
