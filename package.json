@@ -2,12 +2,12 @@
 	"name": "lamirage-whatsapp-bot",
 	"version": "1.0.0",
 	"description": "WhatsApp бот для салона красоты La Mirage by Yuna Khairullina",
-	"main": "index.js",
+	"main": "main.js",
 	"scripts": {
 		"start": "node main.js",
 		"dashboard": "node dashboard/server.js",
 		"dev": "nodemon main.js",
-		"test": "NODE_ENV=test node index.js"
+		"test": "echo \"Error: no test specified\" && exit 1"
 	},
 	"keywords": [
 		"whatsapp",

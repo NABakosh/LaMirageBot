@@ -140,6 +140,164 @@ function getNextDays(count = 7) {
 	return dates
 }
 
+// ===================== STAGE GUARDS (State Machine Protection) =====================
+const VALID_STAGES = [
+	'greeting',
+	'asking_name_and_phone',
+	'asking_phone_only',
+	'conversation',
+	'awaiting_confirmation'
+];
+
+const VALID_TRANSITIONS = {
+	'greeting': ['asking_name_and_phone'],
+	'asking_name_and_phone': ['asking_phone_only', 'conversation'],
+	'asking_phone_only': ['conversation'],
+	'conversation': ['conversation', 'greeting', 'awaiting_confirmation'],
+	'awaiting_confirmation': ['conversation', 'greeting']
+};
+
+function canTransition(from, to) {
+	if (!VALID_STAGES.includes(to)) {
+		console.error(`❌ [STAGE_GUARD] Invalid target stage: ${to}`);
+		return false;
+	}
+	return VALID_TRANSITIONS[from]?.includes(to) ?? false;
+}
+
+function assertStageInvariants(conversation) {
+	const { stage, client_name, client_phone, booking_data } = conversation;
+	
+	// Conversation stage requires both name and phone
+	if (stage === 'conversation' && (!client_name || !client_phone)) {
+		const missing = [];
+		if (!client_name) missing.push('name');
+		if (!client_phone) missing.push('phone');
+		console.error(`❌ [INVARIANT_VIOLATION] stage=conversation requires: ${missing.join(', ')}`);
+		return { valid: false, code: 'INVARIANT_CONVERSATION_INCOMPLETE', missing };
+	}
+	
+	// asking_phone_only requires name
+	if (stage === 'asking_phone_only' && !client_name) {
+		console.error(`❌ [INVARIANT_VIOLATION] stage=asking_phone_only requires name`);
+		return { valid: false, code: 'INVARIANT_PHONE_STAGE_NO_NAME' };
+	}
+	
+	// awaiting_confirmation requires pending_booking data (FIXED: correct field path)
+	if (stage === 'awaiting_confirmation' && !booking_data?.pending_booking) {
+		console.error(`❌ [INVARIANT_VIOLATION] stage=awaiting_confirmation requires booking_data.pending_booking`);
+		return { valid: false, code: 'INVARIANT_CONFIRM_NO_BOOKING' };
+	}
+	
+	return { valid: true };
+}
+
+// Safe stage transition with validation
+function safeStageTransition(conversation, newStage, userId) {
+	const oldStage = conversation.stage;
+	
+	if (!canTransition(oldStage, newStage)) {
+		console.error(`❌ [STAGE_GUARD] Blocked transition: ${oldStage} → ${newStage} for user ${userId}`);
+		return { 
+			success: false, 
+			code: 'INVALID_STAGE_TRANSITION',
+			from: oldStage,
+			to: newStage
+		};
+	}
+	
+	conversation.stage = newStage;
+	console.log(`🔄 [STAGE] ${oldStage} → ${newStage} for user ${userId}`);
+	return { success: true };
+}
+
+// ===================== REJECTION CODES (Structured Logging) =====================
+const REJECTION_CODES = {
+	RATE_LIMIT_EXCEEDED: { code: 'E001', severity: 'warning', admin_action: false },
+	SLOT_BUSY: { code: 'E002', severity: 'info', admin_action: false },
+	VALIDATION_FAILED: { code: 'E003', severity: 'warning', admin_action: true },
+	PAST_DATE: { code: 'E004', severity: 'info', admin_action: false },
+	PAST_TIME: { code: 'E005', severity: 'info', admin_action: false },
+	MASTER_NOT_FOUND: { code: 'E006', severity: 'error', admin_action: true },
+	INVARIANT_VIOLATION: { code: 'E007', severity: 'critical', admin_action: true },
+	DUPLICATE_BOOKING: { code: 'E008', severity: 'info', admin_action: false },
+	OUTSIDE_WORKING_HOURS: { code: 'E009', severity: 'info', admin_action: false },
+	CLIENT_CONFLICT: { code: 'E010', severity: 'info', admin_action: false },
+	INCOMPLETE_DATA: { code: 'E011', severity: 'warning', admin_action: false },
+};
+
+async function logRejection(pool, userId, code, details = {}) {
+	try {
+		const rejection = REJECTION_CODES[code];
+		const logEntry = {
+			code,
+			rejection_code: rejection?.code || 'E999',
+			severity: rejection?.severity || 'unknown',
+			...details,
+			timestamp: new Date().toISOString()
+		};
+		
+		await pool.query(
+			`INSERT INTO booking_logs (booking_id, action, details, user_id)
+			 VALUES (NULL, $1, $2, $3)`,
+			['rejection', JSON.stringify(logEntry), userId]
+		);
+		
+		console.log(`❌ [${rejection?.code || 'E999'}] ${code}: ${JSON.stringify(details)}`);
+		
+		return rejection;
+	} catch (error) {
+		console.error('Error logging rejection:', error);
+		return null;
+	}
+}
+
+// ===================== IDEMPOTENCY KEY (Duplicate Protection) =====================
+const crypto = require('crypto');
+
+function generateIdempotencyKey(userId, master, date, time, service) {
+	const data = `${userId}:${master}:${date}:${time}:${service}`;
+	return crypto.createHash('sha256').update(data).digest('hex').substring(0, 32);
+}
+
+// ===================== CONFIRMATION DETECTION (Phase 4) =====================
+const CONFIRMATION_KEYWORDS = [
+	'да', 'yes', 'ок', 'ok', 'подтверждаю', 'подтвердить', 'верно', 
+	'всё верно', 'все верно', 'правильно', 'согласен', 'согласна',
+	'записывай', 'записывайте', 'бронируй', 'бронируйте', 'давай', 'давайте'
+];
+
+const DENIAL_KEYWORDS = [
+	'нет', 'no', 'отмена', 'отменить', 'не надо', 'не нужно', 
+	'неправильно', 'ошибка', 'изменить', 'другое', 'другой'
+];
+
+function isUserConfirmation(message) {
+	const lower = message.toLowerCase().trim();
+	// Use word-boundary matching to prevent false positives like "недавно" matching "да"
+	const words = lower.split(/\s+/);
+	return CONFIRMATION_KEYWORDS.some(keyword => words.includes(keyword));
+}
+
+function isUserDenial(message) {
+	const lower = message.toLowerCase().trim();
+	// Use word-boundary matching to prevent false positives like "другой мастер" matching "другой"
+	const words = lower.split(/\s+/);
+	return DENIAL_KEYWORDS.some(keyword => words.includes(keyword));
+}
+
+function formatBookingConfirmationMessage(bookingData, clientName) {
+	return `📋 Проверьте данные записи:\n\n` +
+		`📌 Услуга: ${bookingData.service}\n` +
+		`👤 Мастер: ${bookingData.master}\n` +
+		`💰 Цена: ${bookingData.price} тг\n` +
+		`📅 Дата: ${formatDateForDisplay(bookingData.date)}\n` +
+		`🕐 Время: ${bookingData.time}\n\n` +
+		`${clientName}, всё верно?\n\n` +
+		`✅ Напишите "да" или "подтверждаю"\n` +
+		`❌ Если что-то не так — просто напишите что исправить`;
+}
+
 // ===================== ДАННЫЕ О САЛОНЕ (из main.js) =====================
 const MASTERS = {
 	mainMaster: 'Юна',
@@ -671,6 +829,33 @@ async function initDatabase() {
     `)
 		console.log('✅ Столбец duration добавлен в таблицу bookings')
 
+		// Добавление столбцов для системы напоминаний
+		await client.query(`
+      ALTER TABLE bookings 
+      ADD COLUMN IF NOT EXISTS reminder_24h_sent BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS reminder_3h_sent BOOLEAN DEFAULT FALSE;
+    `)
+		console.log('✅ Столбцы reminder_24h_sent и reminder_3h_sent добавлены')
+
+		// Добавление updated_at для idempotency
+		await client.query(`
+      ALTER TABLE bookings 
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+    `)
+
+		// Создание таблицы логов для аудита
+		await client.query(`
+		CREATE TABLE IF NOT EXISTS booking_logs (
+			id SERIAL PRIMARY KEY,
+			booking_id INTEGER,
+			action VARCHAR(50) NOT NULL,
+			details JSONB,
+			user_id VARCHAR(255),
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);
+	`)
+		console.log('✅ Таблица booking_logs создана')
+
 		// Создание таблицы statistics
 		await client.query(`
 			CREATE TABLE IF NOT EXISTS statistics (
@@ -705,8 +890,40 @@ async function initDatabase() {
 			CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings(status);
 			CREATE INDEX IF NOT EXISTS idx_bookings_date ON bookings(date);
 			CREATE INDEX IF NOT EXISTS idx_bookings_reminder ON bookings(date, time, reminder_sent);
+			CREATE INDEX IF NOT EXISTS idx_bookings_master_date ON bookings(master, date);
+			CREATE INDEX IF NOT EXISTS idx_booking_logs_booking_id ON booking_logs(booking_id);
+			CREATE INDEX IF NOT EXISTS idx_booking_logs_created_at ON booking_logs(created_at);
 		`)
 		console.log('✅ Индексы созданы')
+
+		// Добавление столбца idempotency_key для защиты от дубликатов
+		await client.query(`
+			ALTER TABLE bookings 
+			ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(64);
+		`)
+		
+		await client.query(`
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_idempotency 
+			ON bookings(idempotency_key) 
+			WHERE idempotency_key IS NOT NULL;
+		`)
+		console.log('✅ Столбец idempotency_key добавлен')
+
+		// Создание таблицы intent_logs для отладки
+		await client.query(`
+			CREATE TABLE IF NOT EXISTS intent_logs (
+				id SERIAL PRIMARY KEY,
+				user_id VARCHAR(255),
+				intent_type VARCHAR(50),
+				intent_data JSONB,
+				decision VARCHAR(50),
+				reason_code VARCHAR(50),
+				created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			);
+			CREATE INDEX IF NOT EXISTS idx_intent_logs_user_created 
+			ON intent_logs(user_id, created_at DESC);
+		`)
+		console.log('✅ Таблица intent_logs создана')
 
 		// Добавление мастеров в статистику
 		for (const master of SALON_DATA.masters) {
@@ -1469,6 +1686,69 @@ async function handleMessage(msg, sock) {
 		)
 	}
 
+	// Обработка ожидания подтверждения записи (Phase 4: Explicit Confirmation)
+	if (conversation.stage === 'awaiting_confirmation') {
+		const pendingBooking = conversation.booking_data?.pending_booking;
+		
+		if (!pendingBooking) {
+			console.error('❌ [INVARIANT_VIOLATION] awaiting_confirmation without pending_booking');
+			conversation.stage = 'conversation';
+			await saveConversation(conversation);
+			return await replyMessage(sock, msg, 
+				'Произошла ошибка. Давайте начнём сначала - какую услугу вы хотели бы?'
+			);
+		}
+
+		if (isUserConfirmation(userMessage)) {
+			console.log(`✅ Клиент подтвердил запись: ${conversation.client_name}`);
+			
+			// CRITICAL FIX: Clean state BEFORE creating booking to prevent invariant violation
+			// The conversation will be in 'conversation' stage when initiateBookingConfirmation tries to save it
+			const bookingToCreate = { ...pendingBooking };
+			conversation.booking_data.pending_booking = null;
+			conversation.stage = 'conversation';
+			await saveConversation(conversation);
+			
+			// Создаём запись
+			await initiateBookingConfirmation(
+				msg,
+				sock,
+				conversation,
+				bookingToCreate
+			);
+			return;
+		}
+		
+		if (isUserDenial(userMessage)) {
+			console.log(`❌ Клиент отказался от записи: ${conversation.client_name}`);
+			
+			conversation.booking_data.pending_booking = null;
+			conversation.stage = 'conversation';
+			await saveConversation(conversation);
+			
+			return await replyMessage(sock, msg, 
+				'Хорошо, запись отменена! 👌\n\nЕсли хотите изменить что-то — просто напишите, и мы подберём другой вариант.'
+			);
+		}
+		
+		// Если клиент написал что-то другое — возможно хочет изменить данные
+		console.log(`🔄 Клиент хочет изменить данные, возвращаемся в диалог`);
+		
+		conversation.booking_data.pending_booking = null;
+		conversation.stage = 'conversation';
+		
+		// Добавляем сообщение в историю и передаём AI для обработки
+		conversation.history.push({
+			role: 'user',
+			content: userMessage,
+			timestamp: new Date().toISOString(),
+		});
+		
+		await saveConversation(conversation);
+		await generateAndSendResponse(msg, conversation, sock);
+		return;
+	}
+
 	// Режим оператора
 	if (conversation.is_admin_mode && conversation.admin_chat_id) {
 		try {
@@ -1519,9 +1799,24 @@ async function getConversation(userId) {
 	}
 }
 
-// Сохранение разговора в БД
-// Сохранение разговора в БД
+// Сохранение разговора в БД (с проверкой инвариантов)
 async function saveConversation(conversation) {
+	// CRITICAL: Validate invariants BEFORE saving
+	const invariantCheck = assertStageInvariants(conversation);
+	if (!invariantCheck.valid) {
+		console.error(`❌ [SAVE_BLOCKED] Invariant violation: ${invariantCheck.code} for user ${conversation.user_id}`);
+		await logRejection(pool, conversation.user_id, 'INVARIANT_VIOLATION', {
+			code: invariantCheck.code,
+			stage: conversation.stage,
+			has_name: !!conversation.client_name,
+			has_phone: !!conversation.client_phone,
+			has_pending_booking: !!conversation.booking_data?.pending_booking
+		});
+		
+		// Fail-fast: throw instead of silently saving invalid state
+		throw new Error(`INVARIANT_VIOLATION: ${invariantCheck.code}`);
+	}
+	
 	try {
 		await pool.query(
 			`
@@ -1558,9 +1853,10 @@ async function saveConversation(conversation) {
 				conversation.is_admin_mode || false,
 				conversation.admin_chat_id || null,
 			]
-		)
+		);
 	} catch (error) {
-		console.error('Ошибка сохранения разговора:', error)
+		console.error(`❌ [DB_ERROR] Failed to save conversation for ${conversation.user_id}:`, error);
+		throw error; // Re-throw to prevent silent failures
 	}
 }
 
@@ -1610,43 +1906,6 @@ async function resetSession(userId, silent = false) {
 }
 
 // Уведомление о завершении сессии (только когда нужно)
-async function notifySessionExpired(userId) {
-	try {
-		await sendMessage(sock, 
-			userId,
-			`⏰ Ваша сессия завершена из-за неактивности.\n\nЕсли хотите продолжить - просто напишите мне снова! 🤍\n\nЯ буду рада помочь вам! ✨`
-		)
-		console.log(`✅ Уведомление о завершении сессии отправлено: ${userId}`)
-	} catch (error) {
-		console.error('Ошибка отправки уведомления о сессии:', error)
-	}
-}
-// Сброс сессии (обнуление данных)
-async function resetSession(userId) {
-	try {
-		await pool.query(
-			`UPDATE conversations 
-       SET stage = 'greeting',
-           history = '[]'::jsonb,
-           booking_data = '{}'::jsonb,
-           is_admin_mode = FALSE,
-           admin_chat_id = NULL,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE user_id = $1`,
-			[userId]
-		)
-
-		console.log(`🔄 Сессия сброшена для ${userId}`)
-		return true
-	} catch (error) {
-		console.error('Ошибка сброса сессии:', error)
-		return false
-	}
-}
-
-// Уведомление о завершении сессии
-// Уведомление о завершении сессии
-// Уведомление о завершении сессии
 async function notifySessionExpired(userId) {
 	try {
 		await sendMessage(sock, 
@@ -1730,7 +1989,14 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 ТВОЙ ОТВЕТ:`
 
 		const result = await generativeModel.generateContent(fullPrompt)
-		let response = result.response.candidates[0].content.parts[0].text
+	
+	// Проверка на корректность ответа Gemini
+	if (!result.response?.candidates?.[0]?.content?.parts?.[0]?.text) {
+		console.error('❌ Gemini вернул некорректный ответ:', JSON.stringify(result.response, null, 2));
+		throw new Error('Gemini API returned invalid response structure');
+	}
+	
+	let response = result.response.candidates[0].content.parts[0].text
 
 		console.log(`🤖 Ответ AI (сырой): ${response.substring(0, 200)}...`)
 
@@ -1826,6 +2092,36 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 			}
 		}
 
+		// ========== ОБРАБОТКА КОМАНДЫ ПОКАЗАТЬ_РАСПИСАНИЕ ==========
+		if (response.includes('ПОКАЗАТЬ_РАСПИСАНИЕ:')) {
+			const scheduleMatch = response.match(/ПОКАЗАТЬ_РАСПИСАНИЕ:\s*мастер=([^,]+),\s*дата=([^\s]+)/);
+			
+			if (scheduleMatch) {
+				const [, masterName, date] = scheduleMatch;
+				
+				console.log(`📅 Обнаружена команда показа расписания:`);
+				console.log(`   Мастер: ${masterName.trim()}`);
+				console.log(`   Дата: ${date}`);
+				
+				// Получаем свободные слоты с минимальной длительностью (60 мин)
+				const availableSlots = await getAvailableSlots(masterName.trim(), date, 60);
+				
+				if (availableSlots.length > 0) {
+					const slotsText = availableSlots
+						.map(time => `• ${time}`)
+						.join('\n');
+					
+					const scheduleInfo = `\n\n📅 Свободные окошки у мастера ${masterName.trim()} на ${formatDateForDisplay(date)}:\n${slotsText}\n\n(это для услуг продолжительностью до 60 минут)\n\nЧтобы записаться, выберите услугу из списка! ✨`;
+					
+					response = response.replace(/ПОКАЗАТЬ_РАСПИСАНИЕ:.+/, scheduleInfo);
+				} else {
+					response = response.replace(/ПОКАЗАТЬ_РАСПИСАНИЕ:.+/, `\n\n😔 К сожалению, у мастера ${masterName.trim()} на ${formatDateForDisplay(date)} все занято. Попробуйте другую дату!`);
+				}
+				
+				console.log(`✅ Расписание обработано`);
+			}
+		}
+
 		conversation.history.push({
 			role: 'assistant',
 			content: response,
@@ -1838,13 +2134,23 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 		const bookingIntent = await detectBookingIntent(conversation)
 
 		if (bookingIntent.ready) {
-			console.log(`📋 Все данные собраны, создаём запись...`)
-			await initiateBookingConfirmation(
-				msg,
-				sock,
-				conversation,
-				bookingIntent.data
-			)
+			console.log(`📋 Все данные собраны, запрашиваем подтверждение...`);
+			
+			// Сохраняем pending_booking и переводим в стадию ожидания подтверждения
+			if (!conversation.booking_data) {
+				conversation.booking_data = {};
+			}
+			conversation.booking_data.pending_booking = bookingIntent.data;
+			conversation.stage = 'awaiting_confirmation';
+			await saveConversation(conversation);
+			
+			// Отправляем сообщение с подтверждением
+			const confirmMsg = formatBookingConfirmationMessage(
+				bookingIntent.data, 
+				conversation.client_name
+			);
+			
+			return await replyMessage(sock, msg, confirmMsg);
 		} else if (bookingIntent.slotBusy) {
 			console.log(`⚠️ Слот занят (дублирование проверки)`)
 
@@ -2013,6 +2319,23 @@ ${servicesInfo}
    • 4Д-5Д изгибы LM - 8000 тг
    
    Какой эффект вам больше нравится?"
+
+3.5. ЗАПРОС РАСПИСАНИЯ БЕЗ ВЫБОРА УСЛУГИ:
+   
+   Если клиент спрашивает о свободном времени БЕЗ выбора конкретной услуги:
+   
+   Клиент: "какое время свободно у Юны сегодня?"
+   Ты: "Сейчас проверю свободное время! ПОКАЗАТЬ_РАСПИСАНИЕ: мастер=Юна, дата=${today}"
+   
+   После получения списка времени, покажи его и уточни услугу:
+   "Вот свободные окошки у Юны на сегодня:
+   • 10:00
+   • 14:00  
+   • 16:00
+   
+   (это для услуг продолжительностью до 60 минут)
+   
+   Какую услугу вы хотели бы сделать?"
 
 4. ТОЛЬКО ПОСЛЕ ВЫБОРА КОНКРЕТНОЙ УСЛУГИ - проверяй время:
    - Когда клиент выбрал КОНКРЕТНУЮ услугу И указал время - добавь команду:
@@ -2193,6 +2516,210 @@ ${SALON_DATA.services
 	return { ready: false, data: null }
 }
 
+// ===================== ФУНКЦИИ ВАЛИДАЦИИ И ЛОГИРОВАНИЯ =====================
+
+// Логирование действий с записями
+async function logBookingAction(bookingId, action, details, userId) {
+	try {
+		await pool.query(
+			`INSERT INTO booking_logs (booking_id, action, details, user_id)
+			VALUES ($1, $2, $3, $4)`,
+			[bookingId, action, JSON.stringify(details), userId]
+		)
+		console.log(`📝 Лог записан: ${action} для записи #${bookingId}`)
+	} catch (error) {
+		console.error('❌ Ошибка логирования:', error)
+	}
+}
+
+// Валидация даты (не в прошлом, салон работает)
+async function validateBookingDate(date) {
+	try {
+		const bookingDate = new Date(date)
+		const today = new Date()
+		today.setHours(0, 0, 0, 0)
+		
+		// Проверка что дата не в прошлом
+		if (bookingDate < today) {
+			// Log rejection for observability
+			await logRejection(pool, 'SYSTEM', 'PAST_DATE', { attempted_date: date });
+			return {
+				valid: false,
+				error: '⚠️ Невозможно создать запись на прошедшую дату. Пожалуйста, выберите сегодня или более позднюю дату.'
+			}
+		}
+		
+		// Проверка что дата не более чем через 60 дней
+		const maxDate = new Date()
+		maxDate.setDate(maxDate.getDate() + 60)
+		if (bookingDate > maxDate) {
+			return {
+				valid: false,
+				error: '⚠️ Записи доступны только на ближайшие 60 дней.'
+			}
+		}
+		
+		const dayOfWeek = bookingDate.getDay()
+		// Салон работает ежедневно (0 = воскресенье, 6 = суббота)
+		// Если есть выходные дни, добавьте проверку здесь
+		
+		return { valid: true }
+	} catch (error) {
+		return {
+			valid: false,
+			error: '⚠️ Неверный формат даты. Пожалуйста, укажите дату правильно.'
+		}
+	}
+}
+
+// Валидация времени (рабочие часы салона)
+async function validateBookingTime(time) {
+	try {
+		const [hours, minutes] = time.split(':').map(Number)
+		
+		// Проверка формата
+		if (isNaN(hours) || isNaN(minutes) || hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+			return {
+				valid: false,
+				error: '⚠️ Неверный формат времени. Используйте формат ЧЧ:ММ (например, 14:30).'
+			}
+		}
+		
+		// Рабочие часы салона: 10:00 - 21:00
+		const SALON_OPEN = 10;
+		const SALON_CLOSE = 21;
+		
+		if (hours < SALON_OPEN || hours >= SALON_CLOSE) {
+			// Log rejection for observability
+			await logRejection(pool, 'SYSTEM', 'OUTSIDE_WORKING_HOURS', { attempted_time: time });
+			return {
+				valid: false,
+				error: `⚠️ Салон работает с ${SALON_OPEN}:00 до ${SALON_CLOSE}:00. Пожалуйста, выберите время в этом диапазоне.`
+			}
+		}
+		
+		return { valid: true }
+	} catch (error) {
+		return {
+			valid: false,
+			error: '⚠️ Ошибка обработки времени. Пожалуйста, укажите время в формате ЧЧ:ММ.'
+		}
+	}
+}
+
+// Проверка доступности мастера (расписание, выходные)
+async function checkMasterAvailability(masterName, date, time) {
+	// В будущем здесь можно добавить проверку индивидуального графика мастеров
+	// Пока все мастера работают по общему графику салона
+	
+	const dateValidation = validateBookingDate(date)
+	if (!dateValidation.valid) {
+		return dateValidation
+	}
+	
+	const timeValidation = validateBookingTime(time)
+	if (!timeValidation.valid) {
+		return timeValidation
+	}
+	
+	// Проверка что мастер существует
+	const master = SALON_DATA.masters.find(m => m.name === masterName)
+	if (!master) {
+		return {
+			valid: false,
+			error: `⚠️ Мастер ${masterName} не найден. Пожалуйста, выберите мастера из списка.`
+		}
+	}
+	
+	return { valid: true }
+}
+
+// Проверка конфликтов у клиента (нет записи на то же время)
+async function checkClientConflicts(userId, date, time, excludeBookingId = null) {
+	try {
+		const query = excludeBookingId
+			? `SELECT id, service, master, time FROM bookings 
+			   WHERE user_id = $1 AND date = $2 AND status IN ('confirmed', 'pending') AND id != $3`
+			: `SELECT id, service, master, time FROM bookings 
+			   WHERE user_id = $1 AND date = $2 AND status IN ('confirmed', 'pending')`
+		
+		const params = excludeBookingId ? [userId, date, excludeBookingId] : [userId, date]
+		const result = await pool.query(query, params)
+		
+		if (result.rows.length > 0) {
+			const existingBooking = result.rows[0]
+			const existingTime = typeof existingBooking.time === 'string' 
+				? existingBooking.time.substring(0, 5) 
+				: existingBooking.time
+			
+			return {
+				valid: false,
+				error: `⚠️ У вас уже есть запись на ${formatDateForDisplay(date)}:\n📋 ${existingBooking.service}\n👤 Мастер: ${existingBooking.master}\n🕐 Время: ${existingTime}\n\nПожалуйста, выберите другую дату или отмените существующую запись.`
+			}
+		}
+		
+		return { valid: true }
+	} catch (error) {
+		console.error('❌ Ошибка проверки конфликтов клиента:', error)
+		return { valid: true } // В случае ошибки разрешаем продолжить
+	}
+}
+
+// Комплексная валидация данных записи
+async function validateBookingData(bookingData, userId) {
+	const errors = []
+	
+	// Проверка всех обязательных полей
+	if (!bookingData.service) errors.push('услуга')
+	if (!bookingData.master) errors.push('мастер')
+	if (!bookingData.price) errors.push('цена')
+	if (!bookingData.date) errors.push('дата')
+	if (!bookingData.time) errors.push('время')
+	
+	if (errors.length > 0) {
+		// Log rejection for observability
+		await logRejection(pool, userId, 'INCOMPLETE_DATA', { missing_fields: errors });
+		return {
+			valid: false,
+			error: `⚠️ Не указаны следующие данные: ${errors.join(', ')}. Пожалуйста, уточните детали записи.`
+		}
+	}
+	
+	// Валидация даты
+	const dateValidation = validateBookingDate(bookingData.date)
+	if (!dateValidation.valid) {
+		return dateValidation
+	}
+	
+	// Валидация времени
+	const timeValidation = validateBookingTime(bookingData.time)
+	if (!timeValidation.valid) {
+		return timeValidation
+	}
+	
+	// Проверка доступности мастера
+	const masterValidation = await checkMasterAvailability(
+		bookingData.master,
+		bookingData.date,
+		bookingData.time
+	)
+	if (!masterValidation.valid) {
+		return masterValidation
+	}
+	
+	// Проверка конфликтов у клиента
+	const clientConflicts = await checkClientConflicts(
+		userId,
+		bookingData.date,
+		bookingData.time
+	)
+	if (!clientConflicts.valid) {
+		return clientConflicts
+	}
+	
+	return { valid: true }
+}
+
 // Проверка занятости слота через таблицу bookings
 async function checkAvailability(masterName, date, time, durationMinutes = 60) {
 	if (!masterName || !date || !time) return true
@@ -2254,7 +2781,7 @@ async function checkAvailability(masterName, date, time, durationMinutes = 60) {
 	}
 }
 // Получение свободных временных окон для мастера на дату
-async function getAvailableSlots(masterName, date) {
+async function getAvailableSlots(masterName, date, durationMinutes = 60) {
 	try {
 		// Рабочие часы салона: 10:00 - 21:00
 		const workStart = 10
@@ -2298,37 +2825,16 @@ async function getAvailableSlots(masterName, date) {
 		return []
 	}
 }
-// Инициация подтверждения записи
+// Инициация подтверждения записи (АВТОМАТИЧЕСКОЕ СОЗДАНИЕ)
 async function initiateBookingConfirmation(msg, sock, conversation, bookingData) {
 	const userId = msg.key.remoteJid
-	// 1. Rate Limiting: Проверка на спам (не более 5 записей в час)
-	try {
-		const rateLimitCheck = await pool.query(
-			`SELECT COUNT(*) FROM bookings 
-			WHERE user_id = $1 
-			AND created_at > NOW() - INTERVAL '1 hour'`,
-			[userId]
-		)
-
-		if (parseInt(rateLimitCheck.rows[0].count) >= 5) {
-			console.log(`⛔ Rate limit exceeded for ${userId}`)
-			return await replyMessage(sock, msg, 
-				'⚠️ Вы создали слишком много заявок за последний час. Пожалуйста, подождите немного.'
-			)
-		}
-	} catch (e) {
-		console.error('Ошибка rate limit:', e)
-	}
-
-	// Используем сохраненный телефон из разговора, если есть
-	const clientPhone =
-		conversation.client_phone ||
-		(await extractPhoneNumber(userId))
-
-	// Используем имя из conversation, если нет - пытаемся получить из БД
+	
+	// Используем сохраненный телефон из разговора
+	const clientPhone = conversation.client_phone || (await extractPhoneNumber(userId))
+	
+	// Используем имя из conversation
 	let clientName = conversation.client_name
 	if (!clientName || clientName === 'Клиент') {
-		// Попытка получить имя из таблицы clients
 		try {
 			const result = await pool.query(
 				'SELECT name FROM clients WHERE phone = $1',
@@ -2345,22 +2851,70 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 		}
 	}
 
+	let client
 	try {
-		// Находим длительность услуги из SALON_DATA
+		// ===== ЭТАП 1: КОМПЛЕКСНАЯ ВАЛИДАЦИЯ =====
+		console.log(`\n📋 ===== СОЗДАНИЕ ЗАПИСИ =====`)
+		console.log(`👤 Клиент: ${clientName} (${clientPhone})`)
+		console.log(`📋 Услуга: ${bookingData.service}`)
+		console.log(`👨‍💼 Мастер: ${bookingData.master}`)
+		console.log(`💰 Цена: ${bookingData.price} тг`)
+		console.log(`📅 Дата: ${bookingData.date}`)
+		console.log(`🕐 Время: ${bookingData.time}`)
+		
+		// 1.1 Rate Limiting: Проверка на спам
+		const rateLimitCheck = await pool.query(
+			`SELECT COUNT(*) FROM bookings 
+			WHERE user_id = $1 
+			AND created_at > NOW() - INTERVAL '1 hour'`,
+			[userId]
+		)
+
+		if (parseInt(rateLimitCheck.rows[0].count) >= 5) {
+			console.log(`⛔ Rate limit exceeded for ${userId}`)
+			return await replyMessage(sock, msg, 
+				'⚠️ Вы создали слишком много заявок за последний час. Пожалуйста, подождите немного.'
+			)
+		}
+
+		// 1.2 Проверка на дубликаты (та же запись создана менее 5 минут назад)
+		const duplicateCheck = await pool.query(
+			`SELECT id FROM bookings 
+			WHERE user_id = $1 
+			AND master = $2 
+			AND date = $3 
+			AND time = $4 
+			AND status IN ('confirmed', 'pending')
+			AND created_at > NOW() - INTERVAL '5 minutes'
+			LIMIT 1`,
+			[userId, bookingData.master, bookingData.date, bookingData.time]
+		)
+
+		if (duplicateCheck.rows.length > 0) {
+			const existingId = duplicateCheck.rows[0].id
+			console.log(`⚠️ Обнаружена попытка дублирования записи #${existingId}`)
+			return await replyMessage(sock, msg, 
+				`⚠️ Такая запись уже создана (№${existingId})!\n\nЕсли вы хотите изменить запись, сначала отмените существующую.`
+			)
+		}
+
+		// 1.3 Валидация всех данных
+		const validation = await validateBookingData(bookingData, userId)
+		if (!validation.valid) {
+			console.log(`❌ Валидация не пройдена: ${validation.error}`)
+			return await replyMessage(sock, msg, validation.error)
+		}
+
+		// 1.4 Определение длительности услуги
 		const serviceObj = SALON_DATA.services.find(
-			s =>
-				s.name === bookingData.service &&
-				(s.master === bookingData.master || s.master === 'другие')
+			s => s.name === bookingData.service && 
+			(s.master === bookingData.master || s.master === 'другие')
 		)
 		const serviceDuration = serviceObj ? serviceObj.duration : 60
 
-		console.log(
-			`📋 Создание записи: ${bookingData.service} (${serviceDuration} мин)`
-		)
-		console.log(`👤 Мастер: ${bookingData.master}`)
-		console.log(`📅 Дата: ${bookingData.date}, Время: ${bookingData.time}`)
+		console.log(`⏱️ Длительность услуги: ${serviceDuration} минут`)
 
-		// Финальная проверка доступности перед созданием записи
+		// 1.5 Финальная проверка доступности
 		const isFree = await checkAvailability(
 			bookingData.master,
 			bookingData.date,
@@ -2369,21 +2923,14 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 		)
 
 		if (!isFree) {
-			console.log(
-				`⛔ Слот занят при финальной проверке: ${bookingData.master} ${bookingData.date} ${bookingData.time}`
-			)
-
-			// Предлагаем альтернативные варианты
+			console.log(`⛔ Слот занят при финальной проверке`)
+			
 			const availableSlots = await getAvailableSlots(
 				bookingData.master,
 				bookingData.date
 			)
 
-			let alternativeMessage = `⚠️ Извините, время ${
-				bookingData.time
-			} на ${formatDateForDisplay(bookingData.date)} к мастеру ${
-				bookingData.master
-			} уже занято! 😔`
+			let alternativeMessage = `⚠️ Извините, время ${bookingData.time} на ${formatDateForDisplay(bookingData.date)} к мастеру ${bookingData.master} уже занято! 😔`
 
 			if (availableSlots.length > 0) {
 				const slotsText = availableSlots
@@ -2398,11 +2945,52 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 			return await replyMessage(sock, msg, alternativeMessage)
 		}
 
-		// Создаем запись с длительностью
-		const result = await pool.query(
-			`INSERT INTO bookings (user_id, client_name, client_phone, service, master, price, date, time, duration, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
-      RETURNING id`,
+		// ===== ЭТАП 2: АТОМАРНОЕ СОЗДАНИЕ ЗАПИСИ =====
+		client = await pool.connect()
+		await client.query('BEGIN')
+
+		console.log(`\n🔒 Начало транзакции создания записи...`)
+
+		// 2.1 Еще раз проверяем доступность с блокировкой строк
+		const lockCheck = await client.query(
+			`SELECT id FROM bookings 
+			WHERE master = $1 
+			AND date = $2 
+			AND status IN ('confirmed', 'pending')
+			AND (time, (COALESCE(duration, 60) || ' minutes')::interval) OVERLAPS 
+				($3::time, ($4 || ' minutes')::interval)
+			FOR UPDATE`,
+			[bookingData.master, bookingData.date, bookingData.time, serviceDuration]
+		)
+
+		if (lockCheck.rows.length > 0) {
+			await client.query('ROLLBACK')
+			console.log(`⛔ Конфликт обнаружен при блокировке (race condition предотвращен)`)
+			return await replyMessage(sock, msg, 
+				`⚠️ К сожалению, это время только что заняли. Пожалуйста, выберите другое время.`
+			)
+		}
+
+		// 2.2 Создаем запись со статусом 'confirmed' (АВТОМАТИЧЕСКОЕ ПОДТВЕРЖДЕНИЕ)
+		// Генерируем idempotency key для защиты от дубликатов
+		const idempotencyKey = generateIdempotencyKey(
+			userId,
+			bookingData.master,
+			bookingData.date,
+			bookingData.time,
+			bookingData.service
+		);
+		console.log(`🔑 Idempotency key: ${idempotencyKey}`);
+
+		const result = await client.query(
+			`INSERT INTO bookings (
+				user_id, client_name, client_phone, service, master, 
+				price, date, time, duration, status, confirmed_at, idempotency_key
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'confirmed', CURRENT_TIMESTAMP, $10)
+			ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
+			DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+			RETURNING id, (xmax = 0) AS is_new`,
 			[
 				userId,
 				clientName,
@@ -2413,60 +3001,143 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 				bookingData.date,
 				bookingData.time,
 				serviceDuration,
+				idempotencyKey
 			]
 		)
 
 		const bookingId = result.rows[0].id
-		console.log(
-			`✅ Запись #${bookingId} создана с длительностью ${serviceDuration} мин`
+		const isNewBooking = result.rows[0].is_new
+
+		// Если это дубликат (idempotent request), возвращаем существующую запись
+		if (!isNewBooking) {
+			console.log(`⚠️ Идемпотентный запрос: запись #${bookingId} уже существует`);
+			await logRejection(pool, userId, 'DUPLICATE_BOOKING', { 
+				existing_booking_id: bookingId,
+				idempotency_key: idempotencyKey 
+			});
+			await client.query('COMMIT');
+			
+			return await replyMessage(sock, msg, 
+				`✅ Ваша запись #${bookingId} уже подтверждена!\n\n` +
+				`📋 ${bookingData.service}\n` +
+				`👤 Мастер: ${bookingData.master}\n` +
+				`📅 ${formatDateForDisplay(bookingData.date)}\n` +
+				`🕐 ${bookingData.time}\n\n` +
+				`Ждём вас! ✨`
+			);
+		}
+
+		// 2.3 Логируем создание
+		await client.query(
+			`INSERT INTO booking_logs (booking_id, action, details, user_id)
+			VALUES ($1, $2, $3, $4)`,
+			[
+				bookingId,
+				'created',
+				JSON.stringify({
+					service: bookingData.service,
+					master: bookingData.master,
+					date: bookingData.date,
+					time: bookingData.time,
+					price: bookingData.price,
+					duration: serviceDuration,
+					auto_confirmed: true
+				}),
+				userId
+			]
 		)
 
+		// 2.4 Сохраняем/обновляем клиента
+		await client.query(
+			`INSERT INTO clients (phone, name, user_id, created_at)
+			VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+			ON CONFLICT (phone) 
+			DO UPDATE SET 
+				name = EXCLUDED.name,
+				user_id = EXCLUDED.user_id`,
+			[clientPhone, clientName, userId]
+		)
+
+		await client.query('COMMIT')
+		console.log(`✅ Транзакция завершена успешно`)
+		console.log(`✅ Запись #${bookingId} создана и АВТОМАТИЧЕСКИ ПОДТВЕРЖДЕНА`)
+
+		// ===== ЭТАП 3: POST-COMMIT ДЕЙСТВИЯ =====
+		
+		// 3.1 Обновляем conversation
 		conversation.booking_data = {
 			...bookingData,
 			id: bookingId,
 			duration: serviceDuration,
 		}
 
-		// Добавляем системное сообщение в историю, чтобы предотвратить повторное создание
 		conversation.history.push({
 			role: 'assistant',
-			content: `СИСТЕМНОЕ СООБЩЕНИЕ: Запрос на запись #${bookingId} отправлен администратору. Не создавай новую запись по тем же данным.`,
+			content: `СИСТЕМНОЕ СООБЩЕНИЕ: Запись #${bookingId} успешно создана и подтверждена. Ожидание новой команды.`,
 			timestamp: new Date().toISOString(),
 		})
 
 		await saveConversation(conversation)
 
-		// Уведомление клиента
-		// Уведомление клиента (КРАТКОЕ)
-		// Уведомление клиента
+		// 3.2 Уведомление клиента (БЕЗ упоминания "ожидания администратора")
 		await replyMessage(sock, msg, 
-			`Отлично, ${clientName}! Я отправила ваш запрос администратору ✨\n\nДетали записи:\n📋 Услуга: ${
-				bookingData.service
-			}\n👤 Мастер: ${bookingData.master}\n💰 Цена: ${
-				bookingData.price
-			} тг\n⏱️ Длительность: ${serviceDuration} мин\n📅 Дата: ${formatDateForDisplay(
-				bookingData.date
-			)}\n🕐 Время: ${
-				bookingData.time
-			}\n\nВ ближайшее время с вами свяжется администратор! 🤍`
+			`✅ Отлично, ${clientName}! Ваша запись подтверждена! ✨\n\n📋 Услуга: ${bookingData.service}\n👤 Мастер: ${bookingData.master}\n💰 Цена: ${bookingData.price} тг\n⏱️ Длительность: ${serviceDuration} мин\n📅 Дата: ${formatDateForDisplay(bookingData.date)}\n🕐 Время: ${bookingData.time}\n📍 Адрес: ${CONFIG.SALON_ADDRESS}\n\nЖдём вас в ${CONFIG.SALON_NAME}! 🤍\n\nЗа день до визита мы отправим вам напоминание.`
 		)
 
-		// Уведомление админов
-		await notifyAdmins(sock, bookingId)
+		// 3.3 Уведомление админов (только информирование, без кнопок)
+		await notifyAdminsNewBooking(sock, bookingId)
 
-		console.log(`✅ Создана запись #${bookingId} для ${clientName}`)
+		// 3.4 Добавление в Google Calendar
+		try {
+			await addToCalendar({
+				id: bookingId,
+				client_name: clientName,
+				client_phone: clientPhone,
+				service: bookingData.service,
+				master: bookingData.master,
+				price: bookingData.price,
+				date: bookingData.date,
+				time: bookingData.time,
+			})
+		} catch (calError) {
+			console.error('⚠️ Ошибка добавления в календарь:', calError)
+			// Не блокируем создание записи если календарь не работает
+		}
+
+		// 3.5 Обновление статистики
+		try {
+			await updateStatistics({
+				master: bookingData.master,
+				price: bookingData.price,
+				client_phone: clientPhone
+			})
+		} catch (statsError) {
+			console.error('⚠️ Ошибка обновления статистики:', statsError)
+		}
+
+		console.log(`\n✅ ===== ЗАПИСЬ #${bookingId} УСПЕШНО СОЗДАНА =====\n`)
+
 	} catch (error) {
-		console.error('Ошибка создания записи:', error)
+		if (client) {
+			await client.query('ROLLBACK')
+			console.log(`🔙 Транзакция отменена из-за ошибки`)
+		}
+		
+		console.error('❌ Ошибка создания записи:', error)
 		console.error('Детали ошибки:', error.stack)
+		
 		await replyMessage(sock, msg, 
 			'Произошла ошибка при создании записи. Пожалуйста, попробуйте еще раз или свяжитесь с администратором.'
 		)
+	} finally {
+		if (client) {
+			client.release()
+		}
 	}
 }
 
-// Уведомление администраторов
-// Уведомление администраторов
-async function notifyAdmins(sock, bookingId) {
+// Уведомление администраторов о новой записи (БЕЗ КНОПОК ПОДТВЕРЖДЕНИЯ)
+async function notifyAdminsNewBooking(sock, bookingId) {
 	try {
 		const result = await pool.query('SELECT * FROM bookings WHERE id = $1', [
 			bookingId,
@@ -2498,7 +3169,7 @@ async function notifyAdmins(sock, bookingId) {
 			formattedTime = booking.time.substring(0, 5)
 		}
 
-		const adminMessage = `🔔 НОВАЯ ЗАПИСЬ #${booking.id}
+		const adminMessage = `✅ НОВАЯ ЗАПИСЬ #${booking.id} 
 
 👤 Клиент: ${booking.client_name}
 📱 Телефон: ${booking.client_phone}
@@ -2506,11 +3177,11 @@ async function notifyAdmins(sock, bookingId) {
 📋 Услуга: ${booking.service}
 👨‍💼 Мастер: ${booking.master}
 💰 Цена: ${booking.price} тг
+⏱️ Длительность: ${booking.duration || 60} мин
 📅 Дата: ${formattedDate}
 🕐 Время: ${formattedTime}
 
-✅ Подтвердить: /ok ${booking.id}
-❌ Отклонить: /no ${booking.id}`
+Для отмены: /cancel ${booking.id}`
 
 		for (const adminId of CONFIG.ADMIN_WHITELIST) {
 			try {
@@ -2867,54 +3538,111 @@ async function sendAdminStats(msg, sock) {
 		await replyMessage(sock, msg, 'Ошибка получения статистики')
 	}
 }
+// ===================== СИСТЕМА НАПОМИНАНИЙ (УЛУЧШЕННАЯ) =====================
 function startReminderScheduler() {
 	const cron = require('node-cron')
 
+	// Проверка каждые 30 минут
 	cron.schedule('*/30 * * * *', async () => {
 		try {
 			const now = new Date()
-			const oneHourLater = new Date(now.getTime() + 60 * 60 * 1000)
 
-			const result = await pool.query(
+			// ===== НАПОМИНАНИЯ ЗА 24 ЧАСА =====
+			const twentyFourHoursLater = new Date(now.getTime() + 24 * 60 * 60 * 1000)
+			const twentyFourHoursWindow = new Date(now.getTime() + 24.5 * 60 * 60 * 1000)
+
+			const reminder24h = await pool.query(
 				`SELECT * FROM bookings 
 				WHERE status = 'confirmed' 
-				AND reminder_sent = FALSE 
-				AND date = $1 
-				AND time BETWEEN $2 AND $3`,
-				[
-					oneHourLater.toISOString().split('T')[0],
-					now.toTimeString().split(' ')[0].substring(0, 5),
-					oneHourLater.toTimeString().split(' ')[0].substring(0, 5),
-				]
+				AND reminder_24h_sent = FALSE 
+				AND date::timestamp + time::interval BETWEEN $1 AND $2`,
+				[twentyFourHoursLater.toISOString(), twentyFourHoursWindow.toISOString()]
 			)
 
-			console.log(
-				`⏰ Проверка напоминаний: найдено ${result.rows.length} записей`
-			)
+			console.log(`⏰ Проверка напоминаний за 24 часа: найдено ${reminder24h.rows.length} записей`)
 
-			for (const booking of result.rows) {
+			for (const booking of reminder24h.rows) {
 				try {
+					const formattedTime = typeof booking.time === 'string' 
+						? booking.time.substring(0, 5) 
+						: booking.time
+					
+					const bookingDate = new Date(booking.date)
+					const formattedDate = bookingDate.toLocaleDateString('ru-RU', {
+						day: 'numeric',
+						month: 'long',
+						weekday: 'long'
+					})
+
 					await sendMessage(sock, 
 						booking.user_id,
-						`⏰ НАПОМИНАНИЕ О ЗАПИСИ\n\nЗдравствуйте, ${booking.client_name}!\n\nНапоминаем, что сегодня в ${booking.time} у вас запись:\n\n📋 ${booking.service}\n👤 Мастер: ${booking.master}\n📍 Адрес: ${CONFIG.SALON_ADDRESS}\n\nЖдём вас! ✨`
+						`⏰ НАПОМИНАНИЕ О ЗАПИСИ\n\nЗдравствуйте, ${booking.client_name}!\n\nНапоминаем, что завтра в ${formattedTime} у вас запись:\n\n📋 ${booking.service}\n👤 Мастер: ${booking.master}\n📅 ${formattedDate}\n📍 Адрес: ${CONFIG.SALON_ADDRESS}\n\nЖдём вас! ✨\n\nЕсли нужно отменить или перенести запись, напишите нам.`
 					)
 
 					await pool.query(
-						'UPDATE bookings SET reminder_sent = TRUE WHERE id = $1',
+						'UPDATE bookings SET reminder_24h_sent = TRUE WHERE id = $1',
 						[booking.id]
 					)
 
-					console.log(`✅ Напоминание отправлено: ${booking.client_name}`)
+					await logBookingAction(booking.id, 'reminder_24h_sent', {
+						sent_at: new Date().toISOString(),
+						client_name: booking.client_name
+					}, booking.user_id)
+
+					console.log(`✅ Напоминание за 24ч отправлено: ${booking.client_name} (запись #${booking.id})`)
 				} catch (error) {
-					console.error(`Ошибка отправки напоминания для ${booking.id}:`, error)
+					console.error(`Ошибка отправки напоминания за 24ч для записи #${booking.id}:`, error)
+				}
+			}
+
+			// ===== НАПОМИНАНИЯ ЗА 2-3 ЧАСА =====
+			const twoHoursLater = new Date(now.getTime() + 2 * 60 * 60 * 1000)
+			const threeHoursLater = new Date(now.getTime() + 3 * 60 * 60 * 1000)
+
+			const reminder3h = await pool.query(
+				`SELECT * FROM bookings 
+				WHERE status = 'confirmed' 
+				AND reminder_3h_sent = FALSE 
+				AND date::timestamp + time::interval BETWEEN $1 AND $2`,
+				[twoHoursLater.toISOString(), threeHoursLater.toISOString()]
+			)
+
+			console.log(`⏰ Проверка напоминаний за 2-3 часа: найдено ${reminder3h.rows.length} записей`)
+
+			for (const booking of reminder3h.rows) {
+				try {
+					const formattedTime = typeof booking.time === 'string' 
+						? booking.time.substring(0, 5) 
+						: booking.time
+
+					await sendMessage(sock, 
+						booking.user_id,
+						`⏰ НАПОМИНАНИЕ О ЗАПИСИ\n\nЗдравствуйте, ${booking.client_name}!\n\nНапоминаем, что сегодня в ${formattedTime} у вас запись:\n\n📋 ${booking.service}\n👤 Мастер: ${booking.master}\n📍 Адрес: ${CONFIG.SALON_ADDRESS}\n\nЖдём вас! ✨`
+					)
+
+					await pool.query(
+						'UPDATE bookings SET reminder_3h_sent = TRUE WHERE id = $1',
+						[booking.id]
+					)
+
+					await logBookingAction(booking.id, 'reminder_3h_sent', {
+						sent_at: new Date().toISOString(),
+						client_name: booking.client_name
+					}, booking.user_id)
+
+					console.log(`✅ Напоминание за 3ч отправлено: ${booking.client_name} (запись #${booking.id})`)
+				} catch (error) {
+					console.error(`Ошибка отправки напоминания за 3ч для записи #${booking.id}:`, error)
 				}
 			}
 		} catch (error) {
-			console.error('Ошибка в системе напоминаний:', error)
+			console.error('❌ Ошибка в системе напоминаний:', error)
 		}
 	})
 
-	console.log('✅ Система напоминаний запущена (проверка каждые 30 минут)')
+	console.log('✅ Улучшенная система напоминаний запущена (проверка каждые 30 минут)')
+	console.log('   - Напоминания за 24 часа')
+	console.log('   - Напоминания за 2-3 часа')
 }
 // ===================== ПЛАНИРОВЩИК ОЧИСТКИ СЕССИЙ =====================
 function startSessionCleanup() {
