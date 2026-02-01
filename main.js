@@ -11,6 +11,31 @@ const { Pool } = require('pg')
 const cron = require('node-cron')
 const fs = require('fs')
 const P = require('pino')
+const { sendTelegramAlert } = require('./utils/telegram-alerts')
+
+// ===================== МОНИТОРИНГ И МЕТРИКИ =====================
+const METRICS = {
+	bookings_created: 0,
+	bookings_failed: 0,
+	gemini_errors: 0,
+	gemini_calls: 0,
+	start_time: Date.now()
+}
+
+// ===================== ГЛОБАЛЬНОЕ ПОДАВЛЕНИЕ ОШИБОК WHATSAPP =====================
+// Подавляем "Bad MAC" и другие безвредные ошибки Baileys, которые загрязняют логи
+const originalConsoleError = console.error
+console.error = (...args) => {
+	const message = args.join(' ')
+	if (
+		message.includes('Bad MAC') || 
+		message.includes('MessageCounterError') ||
+		message.includes('Failed to decrypt message')
+	) {
+		return // Игнорируем эти ошибки в консоли
+	}
+	originalConsoleError.apply(console, args)
+}
 
 // ===================== ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК =====================
 // Обработчик необработанных ошибок для Baileys
@@ -40,7 +65,24 @@ const CONFIG = {
 	NODE_ENV: process.env.NODE_ENV || 'development',
 	DATABASE_URL:
 		process.env.DATABASE_URL || 'postgresql://localhost:5432/lamiragebeauty',
+	TELEGRAM_ALERT_BOT_TOKEN: process.env.TELEGRAM_ALERT_BOT_TOKEN || null,
+	TELEGRAM_ADMIN_CHAT_ID: process.env.TELEGRAM_ADMIN_CHAT_ID || null,
 }
+
+// Периодический отчет о метриках (каждый час)
+setInterval(() => {
+	const uptime = (Date.now() - METRICS.start_time) / 1000 / 60
+	const totalBookings = METRICS.bookings_created + METRICS.bookings_failed
+	const success_rate = totalBookings > 0 
+		? (METRICS.bookings_created / totalBookings * 100).toFixed(2) 
+		: '0.00'
+	
+	console.log(`\n📊 ОТЧЕТ ПО МЕТРИКАМ (${uptime.toFixed(0)} мин работы):`)
+	console.log(`   ✅ Успешных записей: ${METRICS.bookings_created}`)
+	console.log(`   ❌ Ошибок записи: ${METRICS.bookings_failed}`)
+	console.log(`   📈 Процент успеха: ${success_rate}%`)
+	console.log(`   🤖 Вызовов Gemini: ${METRICS.gemini_calls} (ошибок: ${METRICS.gemini_errors})`)
+}, 60 * 60 * 1000)
 
 // Валидация конфигурации
 // Валидация конфигурации
@@ -1988,16 +2030,16 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 
 ТВОЙ ОТВЕТ:`
 
+		METRICS.gemini_calls++
 		const result = await generativeModel.generateContent(fullPrompt)
 	
-	// Проверка на корректность ответа Gemini
-	if (!result.response?.candidates?.[0]?.content?.parts?.[0]?.text) {
-		console.error('❌ Gemini вернул некорректный ответ:', JSON.stringify(result.response, null, 2));
-		throw new Error('Gemini API returned invalid response structure');
-	}
-	
-	let response = result.response.candidates[0].content.parts[0].text
-
+		// Проверка на корректность ответа Gemini
+		if (!result.response?.candidates?.[0]?.content?.parts?.[0]?.text) {
+			console.error('❌ Gemini вернул некорректный ответ:', JSON.stringify(result.response, null, 2));
+			throw new Error('Gemini API returned invalid response structure');
+		}
+		
+		let response = result.response.candidates[0].content.parts[0].text
 		console.log(`🤖 Ответ AI (сырой): ${response.substring(0, 200)}...`)
 
 		// ПРОВЕРКА НА ЗАПРОС ДОСТУПНОСТИ ВРЕМЕНИ
@@ -2160,7 +2202,7 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 				bookingIntent.data.date
 			)
 
-			let busyMessage = `⚠️ Ой! Прошу прощения, но время ${
+			let busyMessage = `Прошу прощения, но время ${
 				bookingIntent.data.time
 			} на ${formatDateForDisplay(bookingIntent.data.date)} к мастеру ${
 				bookingIntent.data.master
@@ -2193,11 +2235,20 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 			await replyMessage(sock, msg, response)
 		}
 	} catch (error) {
-		console.error('Ошибка Gemini AI:', error)
-		console.error('Детали ошибки:', error.stack)
-		await replyMessage(sock, msg, 
-			'Извините, произошла техническая ошибка. Попробуйте еще раз или позвоните нам.'
-		)
+		METRICS.gemini_errors++
+		console.error('❌ Ошибка генерации ответа Gemini:', error.message)
+		
+		// Отправляем уведомление если ошибок слишком много (например 3 подряд)
+		if (METRICS.gemini_errors % 5 === 0) {
+			await sendTelegramAlert('error', 'Частые ошибки Gemini API', {
+				total_errors: METRICS.gemini_errors,
+				last_error: error.message
+			}, CONFIG.TELEGRAM_ALERT_BOT_TOKEN, CONFIG.TELEGRAM_ADMIN_CHAT_ID)
+		}
+
+		const fallbackMessage = `Извините, сейчас я немного перегружена технически 😔\n\nПожалуйста, попробуйте написать через минуту или позвоните нам прямо в салон! ✨\n\nМы очень ждем вас в ${CONFIG.SALON_NAME} 🤍`
+		
+		return await replyMessage(sock, msg, fallbackMessage)
 	}
 }
 // ===================== СОЗДАНИЕ СИСТЕМНОГО ПРОМПТА С ДАТАМИ =====================
@@ -3116,6 +3167,7 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 		}
 
 		console.log(`\n✅ ===== ЗАПИСЬ #${bookingId} УСПЕШНО СОЗДАНА =====\n`)
+		METRICS.bookings_created++
 
 	} catch (error) {
 		if (client) {
@@ -3126,6 +3178,7 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 		console.error('❌ Ошибка создания записи:', error)
 		console.error('Детали ошибки:', error.stack)
 		
+		METRICS.bookings_failed++
 		await replyMessage(sock, msg, 
 			'Произошла ошибка при создании записи. Пожалуйста, попробуйте еще раз или свяжитесь с администратором.'
 		)
@@ -3735,3 +3788,4 @@ module.exports = {
 	resetSession, // НОВОЕ
 	notifySessionExpired, // НОВОЕ
 }
+	
