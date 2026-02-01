@@ -8,7 +8,13 @@ if [ -z "$1" ]; then
 fi
 
 if [ -f .env ]; then
-  export $(grep -v '^#' .env | xargs)
+  while IFS= read -r line || [ -n "$line" ]; do
+    # Remove carriage return and skip comments/empty lines
+    line=$(echo "$line" | tr -d '\r')
+    if [[ ! "$line" =~ ^# && ! -z "$line" ]]; then
+      export "$line"
+    fi
+  done < .env
 fi
 
 echo "⚠️  ВНИМАНИЕ: Это ЗАМЕНИТ текущую базу данных!"
