@@ -929,7 +929,7 @@ const pool = new Pool({
 
 // Тест подключения
 pool.on('connect', () => {
-	console.log('✅ PostgreSQL подключен')z
+	console.log('✅ PostgreSQL подключен')
 })
 
 pool.on('error', err => {
