@@ -82,3 +82,7 @@ build/
 # Скриншоты и тестовые файлы
 screenshots/
 test-files/
+
+# ===================== ТЕСТОВЫЙ БОТ =====================
+test-bot-session/
+test-logs/

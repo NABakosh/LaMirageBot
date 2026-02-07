@@ -11,20 +11,19 @@ const { Pool } = require('pg')
 const cron = require('node-cron')
 const fs = require('fs')
 const P = require('pino')
-const { sendTelegramAlert } = require('./utils/telegram-alerts')
 const nodemailer = require('nodemailer')
+const { addToCalendar, removeFromCalendar } = require('./calendar-service')
 
-// ===================== МОНИТОРИНГ И МЕТРИКИ =====================
-const METRICS = {
-	bookings_created: 0,
-	bookings_failed: 0,
-	gemini_errors: 0,
-	gemini_calls: 0,
-	start_time: Date.now()
-}
+// ===================== ENTERPRISE MODULES =====================
+const logger = require('./lib/logger')
+const metrics = require('./lib/metrics')
+const alerts = require('./lib/alerts')
+const health = require('./lib/health')
+
+
 
 // ===================== ГЛОБАЛЬНОЕ ПОДАВЛЕНИЕ ОШИБОК WHATSAPP =====================
-// Подавляем "Bad MAC" и другие безвредные ошибки Baileys, которые загрязняют логи
+// Подавляем "Bad MAC" и другие безвредные ошибки Baileys
 const originalConsoleError = console.error
 console.error = (...args) => {
 	const message = args.join(' ')
@@ -33,19 +32,23 @@ console.error = (...args) => {
 		message.includes('MessageCounterError') ||
 		message.includes('Failed to decrypt message')
 	) {
-		return // Игнорируем эти ошибки в консоли
+		return // Игнорируем в консоли
 	}
-	originalConsoleError.apply(console, args)
+	// Логируем через Winston
+	logger.warn('Console error:', { message })
 }
 
 // ===================== ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК =====================
-// Обработчик необработанных ошибок для Baileys
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', async (reason, promise) => {
 	const errorMessage = reason?.message || String(reason)
 	
-	// Логируем ошибки но не падаем
-	console.error('⚠️  Необработанная ошибка Promise:', errorMessage)
-	console.error('Детали:', reason?.stack || reason)
+	logger.error('Unhandled rejection', {
+		error: errorMessage,
+		stack: reason?.stack,
+	})
+	
+	// Critical error alert
+	await alerts.alertCriticalError(reason, { source: 'unhandledRejection' })
 })
 
 // ===================== КОНФИГУРАЦИЯ =====================
@@ -74,18 +77,15 @@ const CONFIG = {
 }
 
 // Периодический отчет о метриках (каждый час)
+// Периодический отчет о метриках (каждый час)
 setInterval(() => {
-	const uptime = (Date.now() - METRICS.start_time) / 1000 / 60
-	const totalBookings = METRICS.bookings_created + METRICS.bookings_failed
-	const success_rate = totalBookings > 0 
-		? (METRICS.bookings_created / totalBookings * 100).toFixed(2) 
-		: '0.00'
+	const uptime = Math.floor(process.uptime() / 60) // минуты
 	
-	console.log(`\n📊 ОТЧЕТ ПО МЕТРИКАМ (${uptime.toFixed(0)} мин работы):`)
-	console.log(`   ✅ Успешных записей: ${METRICS.bookings_created}`)
-	console.log(`   ❌ Ошибок записи: ${METRICS.bookings_failed}`)
-	console.log(`   📈 Процент успеха: ${success_rate}%`)
-	console.log(`   🤖 Вызовов Gemini: ${METRICS.gemini_calls} (ошибок: ${METRICS.gemini_errors})`)
+	logger.info('Hourly metrics report', {
+		uptime_minutes: uptime,
+		memory_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+		active_sessions: metrics.activeSessions?.get()?.values?.[0]?.value || 0
+	})
 }, 60 * 60 * 1000)
 
 // Валидация конфигурации
@@ -759,12 +759,10 @@ const SALON_DATA = {
 // Master-specific email addresses for booking notifications
 const MASTER_EMAILS = {
 	'Юна': 'lamiragebeauty.13@gmail.com',
-	// Add more masters as needed, e.g.:
-	// 'Айгерим': 'email@example.com',
+	'Айгерим': 'goldongame.06@gmail.com', // Assuming Aigul might be Aigerim, or just placeholder
 	// 'Гульназ': 'email@example.com',
 	// 'Жазира': 'email@example.com',
 	// 'Аружан': 'email@example.com',
-	// 'Айлин': 'email@example.com',
 	// 'Лена': 'email@example.com',
 }
 
@@ -878,13 +876,8 @@ async function startWhatsAppBot() {
 		return
 	}
 	
-	console.log('🔄 Starting WhatsApp bot...')
-	botState.running = true
-	botState.startTime = Date.now()
-	botState.stopTime = null
-	
-	// The actual bot initialization will happen in the existing code flow
-	// This is a placeholder that the main code will call
+	// Call the actual startBot function which will update botState
+	await startBot()
 }
 
 // Stop WhatsApp bot function
@@ -896,18 +889,26 @@ async function stopWhatsAppBot() {
 	
 	console.log('🛑 Stopping WhatsApp bot...')
 	
-	if (botState.sock) {
-		try {
+	try {
+		// Close WhatsApp connection if exists
+		if (botState.sock) {
 			await botState.sock.logout()
 			botState.sock = null
-		} catch (error) {
-			console.error('Error during logout:', error.message)
 		}
+		
+		// DON'T close database pool - keep it open for restart
+		// Pool will be closed on process exit (SIGINT)
+		
+		botState.running = false
+		botState.stopTime = Date.now()
+		console.log('✅ WhatsApp bot stopped')
+	} catch (error) {
+		console.error('Error during stop:', error.message)
+		// Still mark as stopped even if there were errors
+		botState.running = false
+		botState.stopTime = Date.now()
+		throw error
 	}
-	
-	botState.running = false
-	botState.stopTime = Date.now()
-	console.log('✅ WhatsApp bot stopped')
 }
 
 // Initialize Telegram bot control
@@ -3309,8 +3310,9 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 		await notifyAdminsNewBooking(sock, bookingId)
 
 		// 3.4 Добавление в Google Calendar
+		let calendarEventId = null;
 		try {
-			await addToCalendar({
+			calendarEventId = await addToCalendar({
 				id: bookingId,
 				client_name: clientName,
 				client_phone: clientPhone,
@@ -3319,7 +3321,17 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 				price: bookingData.price,
 				date: bookingData.date,
 				time: bookingData.time,
+				duration: serviceDuration,
 			})
+			
+			// Сохраняем event_id в базу данных
+			if (calendarEventId) {
+				await pool.query(
+					'UPDATE bookings SET google_calendar_event_id = $1 WHERE id = $2',
+					[calendarEventId, bookingId]
+				);
+				console.log(`✅ Google Calendar Event ID сохранен: ${calendarEventId}`);
+			}
 		} catch (calError) {
 			console.error('⚠️ Ошибка добавления в календарь:', calError)
 			// Не блокируем создание записи если календарь не работает
@@ -3461,6 +3473,27 @@ async function detectCancellation(userId, messageText, sock) {
 				console.log(
 					`🚫 Запись #${booking.id} (${booking.status}) отменена пользователем`
 				)
+				
+				// Удаляем событие из Google Calendar
+				try {
+					// Получаем полную информацию о бронировании включая calendar event id и мастера
+					const fullBookingRes = await pool.query(
+						'SELECT google_calendar_event_id, master FROM bookings WHERE id = $1',
+						[booking.id]
+					);
+					
+					if (fullBookingRes.rows.length > 0) {
+						const { google_calendar_event_id, master } = fullBookingRes.rows[0];
+						
+						if (google_calendar_event_id) {
+							await removeFromCalendar(google_calendar_event_id, master);
+							console.log(`✅ Событие ${google_calendar_event_id} удалено из Google Calendar`);
+						}
+					}
+				} catch (calError) {
+					console.error('⚠️ Ошибка удаления из календаря:', calError);
+					// Не блокируем отмену записи если календарь не работает
+				}
 
 				// Уведомляем админов если запись была подтверждена
 				if (booking.status === 'confirmed') {
@@ -3533,6 +3566,32 @@ async function confirmBooking(msg, sock, command) {
 
 		// Добавление в календарь
 		await addToCalendar(booking)
+
+		// Отправка email уведомления мастеру
+		try {
+			// Преобразование времени в строку, если это объект
+			let timeString = String(booking.time)
+			if (typeof booking.time === 'object') {
+				const h = String(booking.time.hours || 0).padStart(2, '0')
+				const m = String(booking.time.minutes || 0).padStart(2, '0')
+				timeString = `${h}:${m}`
+			} else {
+				timeString = timeString.substring(0, 5)
+			}
+
+			await sendBookingEmail({
+				master: booking.master,
+				service: booking.service,
+				date: booking.date,
+				time: timeString,
+				price: booking.price,
+				clientName: booking.client_name,
+				clientPhone: booking.client_phone
+			})
+		} catch (emailError) {
+			console.error('❌ Ошибка отправки email:', emailError)
+			// Не прерываем выполнение, если email не отправился
+		}
 
 		// Обновление статистики
 		await updateStatistics(booking)
@@ -3626,71 +3685,7 @@ async function rejectBooking(msg, sock, command) {
 	}
 }
 
-// Добавление в Google Calendar
-async function addToCalendar(booking) {
-	if (!calendar) {
-		console.log('⚠️ Google Calendar не настроен')
-		return
-	}
 
-	try {
-		// Нормализация даты (YYYY-MM-DD)
-		let dateStr = ''
-		if (booking.date instanceof Date) {
-			const year = booking.date.getFullYear()
-			const month = String(booking.date.getMonth() + 1).padStart(2, '0')
-			const day = String(booking.date.getDate()).padStart(2, '0')
-			dateStr = `${year}-${month}-${day}`
-		} else {
-			// Если строка, предполагаем YYYY-MM-DD, берем первые 10 символов
-			dateStr = String(booking.date).substring(0, 10)
-		}
-
-		// Нормализация времени (HH:MM)
-		let timeStr = ''
-		if (typeof booking.time === 'object') {
-			const hours = String(booking.time.hours || 0).padStart(2, '0')
-			const minutes = String(booking.time.minutes || 0).padStart(2, '0')
-			timeStr = `${hours}:${minutes}`
-		} else {
-			timeStr = String(booking.time).substring(0, 5)
-		}
-
-		const startDate = new Date(`${dateStr}T${timeStr}:00`)
-		const endDate = new Date(startDate.getTime() + 90 * 60000)
-
-		const event = {
-			summary: `${booking.service} - ${booking.master}`,
-			description: `Клиент: ${
-				booking.client_name || booking.user_id
-			}\nТелефон: ${booking.client_phone}`,
-			start: {
-				dateTime: startDate.toISOString(),
-				timeZone: 'Asia/Almaty',
-			},
-			end: {
-				dateTime: endDate.toISOString(),
-				timeZone: 'Asia/Almaty',
-			},
-			reminders: {
-				useDefault: false,
-				overrides: [
-					{ method: 'popup', minutes: 60 },
-					{ method: 'popup', minutes: 1440 },
-				],
-			},
-		}
-
-		await calendar.events.insert({
-			calendarId: CONFIG.CALENDAR_ID,
-			resource: event,
-		})
-
-		console.log('✅ Запись добавлена в Google Calendar')
-	} catch (error) {
-		console.error('❌ Ошибка добавления в календарь:', error)
-	}
-}
 
 // Обновление статистики
 async function updateStatistics(booking) {
@@ -3914,33 +3909,74 @@ function startSessionCleanup() {
 	)
 }
 // ===================== ЗАПУСК БОТА =====================
+// ===================== ЗАПУСК БОТА =====================
 async function startBot() {
-	console.log('🚀 Запуск бота La Mirage...')
+	logger.info('🚀 Запуск бота La Mirage...')
+
+	// Initialize Alerts
+	alerts.init()
+
+	// Update bot state
+	botState.running = true
+	botState.startTime = Date.now()
+	botState.stopTime = null
 
 	validateConfig()
 	await initDatabase()
 	initVertexAI()
 	await initGoogleCalendar()
+	
+	// Start Health Check Server
+	health.startServer().catch(err => {
+		logger.error('Failed to start health check server', err)
+	})
+
 	await initWhatsApp()
 
 	// Запуск системы напоминаний
 	startSessionCleanup()
+	
+	// Alert start
+	if (alerts.isEnabled()) {
+		await alerts.sendAlert('info', 'Bot Started', 'La Mirage Bot is now running', {
+			environment: CONFIG.NODE_ENV,
+			version: process.env.npm_package_version || '1.0.0'
+		})
+	}
+	
+	logger.info('✅ Bot initialized and running')
 }
 
 if (CONFIG.NODE_ENV !== 'test' && require.main === module) {
-	startBot().catch(console.error)
+	startBot().catch(err => {
+		logger.error('Fatal error during startup', err)
+		alerts.alertCriticalError(err, { stage: 'startup' }).then(() => process.exit(1))
+	})
 }
+
 // Обработка выхода
 process.on('SIGINT', async () => {
-	console.log('\n👋 Остановка бота...')
+	logger.info('\n👋 Остановка бота...')
+	
+	// Alert stop
+	if (alerts.isEnabled()) {
+		await alerts.sendAlert('warning', 'Bot Stopping', 'Received SIGINT signal (manual stop)')
+	}
+	
+	// Update bot state
+	botState.running = false
+	botState.stopTime = Date.now()
+	
 	try {
 		if (whatsappClient && typeof whatsappClient.end === 'function') {
 			await whatsappClient.end()
 		}
 		if (pool) await pool.end()
+		
+		logger.info('Graceful shutdown completed')
 		process.exit(0)
 	} catch (error) {
-		console.error('Ошибка при остановке:', error.message)
+		logger.error('Ошибка при остановке:', error)
 		process.exit(1)
 	}
 })
@@ -3954,8 +3990,8 @@ module.exports = {
 	startBot,
 	checkAvailability,
 	getAvailableSlots,
-	checkSessionExpiry, // НОВОЕ
-	resetSession, // НОВОЕ
-	notifySessionExpired, // НОВОЕ
+	checkSessionExpiry,
+	resetSession,
+	notifySessionExpired,
 }
 	

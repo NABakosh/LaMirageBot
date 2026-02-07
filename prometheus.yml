@@ -1,0 +1,15 @@
+# Prometheus Configuration
+# Настройка для скрейпинга метрик La Mirage Bot
+
+global:
+  scrape_interval: 15s # Собирать метрики каждые 15 секунд
+  evaluation_interval: 15s # Оценка правил каждые 15 секунд
+
+scrape_configs:
+  - job_name: 'lamirage-bot'
+    static_configs:
+      - targets: ['host.docker.internal:3001'] # Порт health check сервера
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
