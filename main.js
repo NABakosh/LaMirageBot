@@ -12,6 +12,7 @@ const cron = require('node-cron')
 const fs = require('fs')
 const P = require('pino')
 const { sendTelegramAlert } = require('./utils/telegram-alerts')
+const nodemailer = require('nodemailer')
 
 // ===================== МОНИТОРИНГ И МЕТРИКИ =====================
 const METRICS = {
@@ -67,6 +68,9 @@ const CONFIG = {
 		process.env.DATABASE_URL || 'postgresql://localhost:5432/lamiragebeauty',
 	TELEGRAM_ALERT_BOT_TOKEN: process.env.TELEGRAM_ALERT_BOT_TOKEN || null,
 	TELEGRAM_ADMIN_CHAT_ID: process.env.TELEGRAM_ADMIN_CHAT_ID || null,
+	// Email configuration
+	EMAIL_USER: process.env.EMAIL_USER || 'lamiragebeauty.13@gmail.com',
+	EMAIL_PASSWORD: process.env.EMAIL_PASSWORD || null, // App Password needed
 }
 
 // Периодический отчет о метриках (каждый час)
@@ -441,7 +445,7 @@ const SALON_DATA = {
 			name: 'Снятие покрытия',
 			master: 'Юна',
 			price: 1000,
-			duration: 30,
+			duration: 60,
 			category: 'маникюр',
 		},
 		{
@@ -457,28 +461,28 @@ const SALON_DATA = {
 			name: 'Маникюр без покрытия',
 			master: 'другие',
 			price: 1000,
-			duration: 150,
+			duration: 180,
 			category: 'маникюр',
 		},
 		{
 			name: 'Маникюр с укреплением',
 			master: 'другие',
 			price: 3500,
-			duration: 150,
+			duration: 180,
 			category: 'маникюр',
 		},
 		{
 			name: 'Наращивание ногтей',
 			master: 'другие',
 			price: 5000,
-			duration: 150,
+			duration: 180,
 			category: 'маникюр',
 		},
 		{
 			name: 'Снятие покрытия',
 			master: 'другие',
 			price: 500,
-			duration: 150,
+			duration: 60,
 			category: 'маникюр',
 		},
 		{
@@ -529,7 +533,7 @@ const SALON_DATA = {
 			name: 'Снятие ресниц (чужое/своё без наращивания)',
 			master: 'Лена',
 			price: 1000,
-			duration: 30,
+			duration: 120,
 			category: 'ресницы',
 		},
 
@@ -561,14 +565,14 @@ const SALON_DATA = {
 			name: 'Коррекция бровей воск/пинцет',
 			master: 'Лена',
 			price: 1500,
-			duration: 30,
+			duration: 120,
 			category: 'брови',
 		},
 		{
 			name: 'Окрашивание бровей',
 			master: 'Лена',
 			price: 2000,
-			duration: 30,
+			duration: 120,
 			category: 'брови',
 		},
 
@@ -621,126 +625,126 @@ const SALON_DATA = {
 			name: 'Шугаринг лицо полностью',
 			master: 'Лена',
 			price: 3500,
-			duration: 30,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг лоб',
 			master: 'Лена',
 			price: 500,
-			duration: 10,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг усики',
 			master: 'Лена',
 			price: 500,
-			duration: 10,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг подбородок',
 			master: 'Лена',
 			price: 500,
-			duration: 10,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг бакенбарды',
 			master: 'Лена',
 			price: 1000,
-			duration: 15,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг затылок',
 			master: 'Лена',
 			price: 1000,
-			duration: 15,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг спина',
 			master: 'Лена',
 			price: 1500,
-			duration: 30,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг живот полностью',
 			master: 'Лена',
 			price: 1500,
-			duration: 25,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг линия живота',
 			master: 'Лена',
 			price: 500,
-			duration: 10,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг поясница',
 			master: 'Лена',
 			price: 1000,
-			duration: 15,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг ягодицы',
 			master: 'Лена',
 			price: 1000,
-			duration: 20,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг глубокое бикини',
 			master: 'Лена',
 			price: 4000,
-			duration: 45,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг классическое бикини',
 			master: 'Лена',
 			price: 3000,
-			duration: 30,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг подмышки',
 			master: 'Лена',
 			price: 1000,
-			duration: 15,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг ноги полностью',
 			master: 'Лена',
 			price: 4000,
-			duration: 60,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг ноги до колен',
 			master: 'Лена',
 			price: 3000,
-			duration: 40,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг руки полностью',
 			master: 'Лена',
 			price: 3000,
-			duration: 45,
+			duration: 120,
 			category: 'шугаринг',
 		},
 		{
 			name: 'Шугаринг руки до локтя',
 			master: 'Лена',
 			price: 2500,
-			duration: 30,
+			duration: 120,
 			category: 'шугаринг',
 		},
 	],
@@ -751,6 +755,172 @@ const SALON_DATA = {
 	address: CONFIG.SALON_ADDRESS,
 }
 
+// ===================== EMAIL CONFIGURATION =====================
+// Master-specific email addresses for booking notifications
+const MASTER_EMAILS = {
+	'Юна': 'lamiragebeauty.13@gmail.com',
+	// Add more masters as needed, e.g.:
+	// 'Айгерим': 'email@example.com',
+	// 'Гульназ': 'email@example.com',
+	// 'Жазира': 'email@example.com',
+	// 'Аружан': 'email@example.com',
+	// 'Айлин': 'email@example.com',
+	// 'Лена': 'email@example.com',
+}
+
+// Email transporter configuration
+let emailTransporter = null
+if (CONFIG.EMAIL_USER && CONFIG.EMAIL_PASSWORD) {
+	try {
+		emailTransporter = nodemailer.createTransport({
+			service: 'gmail',
+			auth: {
+				user: CONFIG.EMAIL_USER,
+				pass: CONFIG.EMAIL_PASSWORD
+			}
+		})
+		console.log('✅ Email transporter configured')
+	} catch (error) {
+		console.error('❌ Failed to configure email transporter:', error.message)
+	}
+} else {
+	console.warn('⚠️  Email not configured. Set EMAIL_USER and EMAIL_PASSWORD in .env')
+}
+
+// Send booking notification email to master
+async function sendBookingEmail(bookingDetails) {
+	if (!emailTransporter) {
+		console.warn('⚠️  Email transporter not configured, skipping email notification')
+		return false
+	}
+
+	const masterEmail = MASTER_EMAILS[bookingDetails.master]
+	if (!masterEmail) {
+		console.log(`ℹ️  No email configured for master: ${bookingDetails.master}`)
+		return false
+	}
+
+	try {
+		const mailOptions = {
+			from: CONFIG.EMAIL_USER,
+			to: masterEmail,
+			subject: `Новая запись - ${bookingDetails.service} - ${formatDateForDisplay(bookingDetails.date)}`,
+			html: `
+				<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+					<h2 style="color: #4CAF50;">✨ Новая запись в La Mirage Beauty</h2>
+					
+					<table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+						<tr style="background-color: #f2f2f2;">
+							<td style="padding: 10px; border: 1px solid #ddd;"><strong>Клиент:</strong></td>
+							<td style="padding: 10px; border: 1px solid #ddd;">${bookingDetails.clientName}</td>
+						</tr>
+						<tr>
+							<td style="padding: 10px; border: 1px solid #ddd;"><strong>Телефон:</strong></td>
+							<td style="padding: 10px; border: 1px solid #ddd;">${bookingDetails.clientPhone}</td>
+						</tr>
+						<tr style="background-color: #f2f2f2;">
+							<td style="padding: 10px; border: 1px solid #ddd;"><strong>Услуга:</strong></td>
+							<td style="padding: 10px; border: 1px solid #ddd;">${bookingDetails.service}</td>
+						</tr>
+						<tr>
+							<td style="padding: 10px; border: 1px solid #ddd;"><strong>Дата:</strong></td>
+							<td style="padding: 10px; border: 1px solid #ddd;">${formatDateForDisplay(bookingDetails.date)}</td>
+						</tr>
+						<tr style="background-color: #f2f2f2;">
+							<td style="padding: 10px; border: 1px solid #ddd;"><strong>Время:</strong></td>
+							<td style="padding: 10px; border: 1px solid #ddd;">${bookingDetails.time}</td>
+						</tr>
+						<tr>
+							<td style="padding: 10px; border: 1px solid #ddd;"><strong>Цена:</strong></td>
+							<td style="padding: 10px; border: 1px solid #ddd;">${bookingDetails.price} тг</td>
+						</tr>
+					</table>
+
+					<p style="margin-top: 20px; color: #666;">
+						Запись создана ${new Date().toLocaleString('ru-RU', { timeZone: 'Asia/Almaty' })}
+					</p>
+					
+					<hr style="margin-top: 30px; border: none; border-top: 1px solid #eee;">
+					<p style="color: #999; font-size: 12px; text-align: center;">
+						La Mirage Beauty - Автоматическое уведомление
+					</p>
+				</div>
+			`
+		}
+
+		const info = await emailTransporter.sendMail(mailOptions)
+		console.log(`✅ Email sent to ${masterEmail} for booking with ${bookingDetails.clientName}`)
+		return true
+	} catch (error) {
+		console.error(`❌ Failed to send email to ${masterEmail}:`, error.message)
+		return false
+	}
+}
+
+
+
+// ===================== BOT STATE MANAGEMENT =====================
+// Global state for bot control via Telegram
+const botState = {
+	running: false,
+	sock: null,
+	startTime: null,
+	stopTime: null
+}
+
+// ===================== TELEGRAM BOT CONTROL =====================
+const { initTelegramBot } = require('./utils/telegram-bot')
+
+// Start WhatsApp bot function
+async function startWhatsAppBot() {
+	if (botState.running) {
+		console.log('⚠️  WhatsApp bot is already running')
+		return
+	}
+	
+	console.log('🔄 Starting WhatsApp bot...')
+	botState.running = true
+	botState.startTime = Date.now()
+	botState.stopTime = null
+	
+	// The actual bot initialization will happen in the existing code flow
+	// This is a placeholder that the main code will call
+}
+
+// Stop WhatsApp bot function
+async function stopWhatsAppBot() {
+	if (!botState.running) {
+		console.log('⚠️  WhatsApp bot is already stopped')
+		return
+	}
+	
+	console.log('🛑 Stopping WhatsApp bot...')
+	
+	if (botState.sock) {
+		try {
+			await botState.sock.logout()
+			botState.sock = null
+		} catch (error) {
+			console.error('Error during logout:', error.message)
+		}
+	}
+	
+	botState.running = false
+	botState.stopTime = Date.now()
+	console.log('✅ WhatsApp bot stopped')
+}
+
+// Initialize Telegram bot control
+if (CONFIG.TELEGRAM_ALERT_BOT_TOKEN && CONFIG.TELEGRAM_ADMIN_CHAT_ID) {
+	initTelegramBot(
+		startWhatsAppBot,
+		stopWhatsAppBot,
+		() => botState,
+		CONFIG.TELEGRAM_ALERT_BOT_TOKEN,
+		CONFIG.TELEGRAM_ADMIN_CHAT_ID
+	)
+}
+
 // ===================== POSTGRESQL =====================
 const pool = new Pool({
 	connectionString: CONFIG.DATABASE_URL,
@@ -759,7 +929,7 @@ const pool = new Pool({
 
 // Тест подключения
 pool.on('connect', () => {
-	console.log('✅ PostgreSQL подключен')
+	console.log('✅ PostgreSQL подключен')z
 })
 
 pool.on('error', err => {

@@ -29,6 +29,8 @@
 		"express": "^5.2.1",
 		"googleapis": "^126.0.1",
 		"node-cron": "^4.2.1",
+		"node-telegram-bot-api": "^0.67.0",
+		"nodemailer": "^8.0.0",
 		"pg": "^8.11.3",
 		"pino": "^8.16.2",
 		"qrcode-terminal": "^0.12.0"
