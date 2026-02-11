@@ -766,6 +766,32 @@ const MASTER_EMAILS = {
 	// 'Лена': 'email@example.com',
 }
 
+// ===================== MASTER WHATSAPP PHONES =====================
+// Телефоны мастеров для WhatsApp напоминаний
+const MASTER_PHONES = {
+	'Жазира': process.env.MASTER_PHONE_ЖАЗИРА || null,
+	'Аружан': process.env.MASTER_PHONE_АРУЖАН || null,
+	'Гульназ': process.env.MASTER_PHONE_ГУЛЬНАЗ || null,
+	'Айгерим': process.env.MASTER_PHONE_АЙГЕРИМ || null,
+	'Юна': process.env.MASTER_PHONE_ЮНА || null,
+	'Лена': process.env.MASTER_PHONE_ЛЕНА || null,
+}
+
+/**
+ * Получает WhatsApp JID мастера
+ * @param {string} masterName - Имя мастера
+ * @returns {string|null} - WhatsApp JID или null
+ */
+function getMasterWhatsAppId(masterName) {
+	const phone = MASTER_PHONES[masterName]
+	if (!phone) {
+		console.log(`ℹ️ WhatsApp номер для мастера "${masterName}" не настроен`)
+		return null
+	}
+	// Формат WhatsApp JID: номер@s.whatsapp.net
+	return `${phone}@s.whatsapp.net`
+}
+
 // Email transporter configuration
 let emailTransporter = null
 if (CONFIG.EMAIL_USER && CONFIG.EMAIL_PASSWORD) {
@@ -1049,6 +1075,15 @@ async function initDatabase() {
       ADD COLUMN IF NOT EXISTS reminder_3h_sent BOOLEAN DEFAULT FALSE;
     `)
 		console.log('✅ Столбцы reminder_24h_sent и reminder_3h_sent добавлены')
+
+	// Добавление столбцов для напоминаний мастерам через WhatsApp
+	await client.query(`
+      ALTER TABLE bookings 
+      ADD COLUMN IF NOT EXISTS reminder_master_6h_sent BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS reminder_master_2h_sent BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS reminder_master_1h_sent BOOLEAN DEFAULT FALSE;
+    `)
+	console.log('✅ Столбцы для напоминаний мастерам добавлены (6h, 2h, 1h)')
 
 		// Добавление updated_at для idempotency
 		await client.query(`
@@ -3757,6 +3792,54 @@ async function sendAdminStats(msg, sock) {
 	}
 }
 // ===================== СИСТЕМА НАПОМИНАНИЙ (УЛУЧШЕННАЯ) =====================
+/**
+ * Отправляет WhatsApp напоминание мастеру о предстоящей записи
+ * @param {Object} sock - WhatsApp сокет
+ * @param {Object} booking - Данные бронирования
+ * @param {string} timeInterval - Временной интервал (например, "6 часов", "2 часа", "1 час")
+ * @returns {Promise<boolean>} - true если успешно, false при ошибке
+ */
+async function sendMasterReminder(sock, booking, timeInterval) {
+	try {
+		const masterWhatsAppId = getMasterWhatsAppId(booking.master)
+		
+		if (!masterWhatsAppId) {
+			console.log(`ℹ️ Пропускаем напоминание мастеру ${booking.master} - номер не настроен`)
+			return false
+		}
+
+		const formattedTime = typeof booking.time === 'string' 
+			? booking.time.substring(0, 5) 
+			: booking.time
+
+		const bookingDate = new Date(booking.date)
+		const formattedDate = bookingDate.toLocaleDateString('ru-RU', {
+			day: 'numeric',
+			month: 'long',
+			weekday: 'long'
+		})
+
+		const reminderMessage = 
+			`🔔 НАПОМИНАНИЕ О ЗАПИСИ (через ${timeInterval})\n\n` +
+			`📅 Дата: ${formattedDate}\n` +
+			`🕐 Время: ${formattedTime}\n` +
+			`👤 Клиент: ${booking.client_name}\n` +
+			`📞 Телефон: ${booking.client_phone}\n` +
+			`📋 Услуга: ${booking.service}\n` +
+			`💰 Цена: ${booking.price} тг\n\n` +
+			`📍 Адрес: ${CONFIG.SALON_ADDRESS}`
+
+		await sendMessage(sock, masterWhatsAppId, reminderMessage)
+		
+		console.log(`✅ Напоминание через ${timeInterval} отправлено мастеру ${booking.master} для записи #${booking.id}`)
+		return true
+		
+	} catch (error) {
+		console.error(`❌ Ошибка отправки напоминания мастеру для записи #${booking.id}:`, error.message)
+		return false
+	}
+}
+
 function startReminderScheduler() {
 	const cron = require('node-cron')
 
@@ -3853,14 +3936,117 @@ function startReminderScheduler() {
 					console.error(`Ошибка отправки напоминания за 3ч для записи #${booking.id}:`, error)
 				}
 			}
+
+			// ===== НАПОМИНАНИЯ МАСТЕРАМ ЗА 6 ЧАСОВ =====
+			const sixHoursLater = new Date(now.getTime() + 6 * 60 * 60 * 1000)
+			const sixHoursWindow = new Date(now.getTime() + 6.5 * 60 * 60 * 1000)
+
+			const reminderMaster6h = await pool.query(
+				`SELECT * FROM bookings 
+				WHERE status = 'confirmed' 
+				AND reminder_master_6h_sent = FALSE 
+				AND date::timestamp + time::interval BETWEEN $1 AND $2`,
+				[sixHoursLater.toISOString(), sixHoursWindow.toISOString()]
+			)
+
+			console.log(`⏰ Проверка напоминаний мастерам за 6 часов: найдено ${reminderMaster6h.rows.length} записей`)
+
+			for (const booking of reminderMaster6h.rows) {
+				try {
+					await sendMasterReminder(sock, booking, '6 часов')
+
+					await pool.query(
+						'UPDATE bookings SET reminder_master_6h_sent = TRUE WHERE id = $1',
+						[booking.id]
+					)
+
+					await logBookingAction(booking.id, 'reminder_master_6h_sent', {
+						sent_at: new Date().toISOString(),
+						master: booking.master
+					}, booking.user_id)
+
+				} catch (error) {
+					console.error(`Ошибка отправки напоминания мастеру за 6ч для записи #${booking.id}:`, error)
+				}
+			}
+
+			// ===== НАПОМИНАНИЯ МАСТЕРАМ ЗА 2 ЧАСА =====
+			const twoHoursLaterMaster = new Date(now.getTime() + 2 * 60 * 60 * 1000)
+			const twoHoursWindowMaster = new Date(now.getTime() + 2.5 * 60 * 60 * 1000)
+
+			const reminderMaster2h = await pool.query(
+				`SELECT * FROM bookings 
+				WHERE status = 'confirmed' 
+				AND reminder_master_2h_sent = FALSE 
+				AND date::timestamp + time::interval BETWEEN $1 AND $2`,
+				[twoHoursLaterMaster.toISOString(), twoHoursWindowMaster.toISOString()]
+			)
+
+			console.log(`⏰ Проверка напоминаний мастерам за 2 часа: найдено ${reminderMaster2h.rows.length} записей`)
+
+			for (const booking of reminderMaster2h.rows) {
+				try {
+					await sendMasterReminder(sock, booking, '2 часа')
+
+					await pool.query(
+						'UPDATE bookings SET reminder_master_2h_sent = TRUE WHERE id = $1',
+						[booking.id]
+					)
+
+					await logBookingAction(booking.id, 'reminder_master_2h_sent', {
+						sent_at: new Date().toISOString(),
+						master: booking.master
+					}, booking.user_id)
+
+				} catch (error) {
+					console.error(`Ошибка отправки напоминания мастеру за 2ч для записи #${booking.id}:`, error)
+				}
+			}
+
+			// ===== НАПОМИНАНИЯ МАСТЕРАМ ЗА 1 ЧАС =====
+			const oneHourLater = new Date(now.getTime() + 1 * 60 * 60 * 1000)
+			const oneHourWindow = new Date(now.getTime() + 1.5 * 60 * 60 * 1000)
+
+			const reminderMaster1h = await pool.query(
+				`SELECT * FROM bookings 
+				WHERE status = 'confirmed' 
+				AND reminder_master_1h_sent = FALSE 
+				AND date::timestamp + time::interval BETWEEN $1 AND $2`,
+				[oneHourLater.toISOString(), oneHourWindow.toISOString()]
+			)
+
+			console.log(`⏰ Проверка напоминаний мастерам за 1 час: найдено ${reminderMaster1h.rows.length} записей`)
+
+			for (const booking of reminderMaster1h.rows) {
+				try {
+					await sendMasterReminder(sock, booking, '1 час')
+
+					await pool.query(
+						'UPDATE bookings SET reminder_master_1h_sent = TRUE WHERE id = $1',
+						[booking.id]
+					)
+
+					await logBookingAction(booking.id, 'reminder_master_1h_sent', {
+						sent_at: new Date().toISOString(),
+						master: booking.master
+					}, booking.user_id)
+
+				} catch (error) {
+					console.error(`Ошибка отправки напоминания мастеру за 1ч для записи #${booking.id}:`, error)
+				}
+			}
+
 		} catch (error) {
 			console.error('❌ Ошибка в системе напоминаний:', error)
 		}
 	})
 
 	console.log('✅ Улучшенная система напоминаний запущена (проверка каждые 30 минут)')
-	console.log('   - Напоминания за 24 часа')
-	console.log('   - Напоминания за 2-3 часа')
+	console.log('   - Напоминания клиентам за 24 часа')
+	console.log('   - Напоминания клиентам за 2-3 часа')
+	console.log('   - Напоминания мастерам за 6 часов')
+	console.log('   - Напоминания мастерам за 2 часа')
+	console.log('   - Напоминания мастерам за 1 час')
 }
 // ===================== ПЛАНИРОВЩИК ОЧИСТКИ СЕССИЙ =====================
 function startSessionCleanup() {

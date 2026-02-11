@@ -6,14 +6,15 @@ const fs = require('fs');
 const path = require('path');
 
 // Маппинг мастеров на их календари
-// Добавляйте новых мастеров по мере необходимости
+// Только Юна получает события в свой личный календарь
+// Остальные мастера не получают календарные события
 const MASTER_CALENDARS = {
-  'Айгерим': process.env.CALENDAR_AIGERIM || null,
+  'Айгерим': null,
   'Юна': process.env.CALENDAR_YUNA || null,
-  'Аружан': process.env.CALENDAR_АРУЖАН || null,
-  'Гульназ': process.env.CALENDAR_ГУЛЬНАЗ || null,
-  'Жазира': process.env.CALENDAR_ЖАЗИРА || null,
-  'Лена': process.env.CALENDAR_ЛЕНА || null,
+  'Аружан': null,
+  'Гульназ': null,
+  'Жазира': null,
+  'Лена': null,
 };
 
 // Инициализация Google Calendar API клиента
