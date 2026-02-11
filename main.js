@@ -2236,7 +2236,7 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 
 ТВОЙ ОТВЕТ:`
 
-		METRICS.gemini_calls++
+		metrics.geminiCalls.inc()
 		const result = await generativeModel.generateContent(fullPrompt)
 	
 		// Проверка на корректность ответа Gemini
@@ -2441,13 +2441,15 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 			await replyMessage(sock, msg, response)
 		}
 	} catch (error) {
-		METRICS.gemini_errors++
+		metrics.geminiErrors.inc()
 		console.error('❌ Ошибка генерации ответа Gemini:', error.message)
 		
-		// Отправляем уведомление если ошибок слишком много (например 3 подряд)
-		if (METRICS.gemini_errors % 5 === 0) {
+		// Отправляем уведомление каждые 5 ошибок
+		const errorsMetric = await metrics.geminiErrors.get()
+		const errorCount = errorsMetric?.values?.[0]?.value || 0
+		if (errorCount > 0 && errorCount % 5 === 0) {
 			await sendTelegramAlert('error', 'Частые ошибки Gemini API', {
-				total_errors: METRICS.gemini_errors,
+				total_errors: errorCount,
 				last_error: error.message
 			}, CONFIG.TELEGRAM_ALERT_BOT_TOKEN, CONFIG.TELEGRAM_ADMIN_CHAT_ID)
 		}
@@ -3384,7 +3386,7 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 		}
 
 		console.log(`\n✅ ===== ЗАПИСЬ #${bookingId} УСПЕШНО СОЗДАНА =====\n`)
-		METRICS.bookings_created++
+		metrics.bookingsCreated.inc()
 
 	} catch (error) {
 		if (client) {
@@ -3395,7 +3397,7 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 		console.error('❌ Ошибка создания записи:', error)
 		console.error('Детали ошибки:', error.stack)
 		
-		METRICS.bookings_failed++
+		metrics.bookingsFailed.inc()
 		await replyMessage(sock, msg, 
 			'Произошла ошибка при создании записи. Пожалуйста, попробуйте еще раз или свяжитесь с администратором.'
 		)
