@@ -13,6 +13,7 @@ const fs = require('fs')
 const P = require('pino')
 const nodemailer = require('nodemailer')
 const { addToCalendar, removeFromCalendar } = require('./calendar-service')
+const ReminderService = require('./reminder-service')
 
 // ===================== ENTERPRISE MODULES =====================
 const logger = require('./lib/logger')
@@ -349,6 +350,35 @@ const MASTERS = {
 	mainMaster: 'Юна',
 	secondaryMasters: ['Гульназ', 'Жазира', 'Айгерим', 'Аружан', 'Айлин'],
 }
+
+// ===================== КОНТАКТНЫЕ ДАННЫЕ МАСТЕРОВ =====================
+const MASTER_CONTACTS = {
+	'Жазира': {
+		email: 'jsuleimenovna@mail.ru',
+		phone: '87711316057'
+	},
+	'Аружан': {
+		email: 'baibulanova12@icloud.com',
+		phone: '87085682707'
+	},
+	'Гульназ': {
+		email: 'tdknailsg@gmail.com',
+		phone: '77472431078'
+	},
+	'Айгерим': {
+		email: 'kuandyk.aigerim03@icloud.com',
+		phone: '87002729742'
+	},
+	'Юна': {
+		email: 'Yunakhairullina13@gmail.com',
+		phone: '87473499566'
+	},
+	'Лена': {
+		phone: '87472448748'
+		// Нет email для Лены
+	}
+}
+
 
 const PRICES = [
 	{
@@ -855,7 +885,51 @@ async function sendBookingEmail(bookingDetails) {
 	}
 }
 
+// ===================== УВЕДОМЛЕНИЕ МАСТЕРОВ О НОВОЙ ЗАПИСИ =====================
+async function notifyAdminsNewBooking(sock, bookingId) {
+	try {
+		// Получаем информацию о записи
+		const result = await pool.query(
+			`SELECT id, client_name, client_phone, service, master, price, date, time, duration
+			 FROM bookings WHERE id = $1`,
+			[bookingId]
+		)
 
+		if (result.rows.length === 0) {
+			console.log(`⚠️ Запись #${bookingId} не найдена для уведомления`)
+			return
+		}
+
+		const booking = result.rows[0]
+		const masterContact = MASTER_CONTACTS[booking.master]
+
+		if (!masterContact || !masterContact.phone) {
+			console.log(`⚠️ Нет контакта для мастера ${booking.master}`)
+			return
+		}
+
+		// Форматируем сообщение для мастера
+		const message = 
+			`🔔 Новая запись!\n\n` +
+			`📋 Запись #${booking.id}\n` +
+			`👤 Клиент: ${booking.client_name}\n` +
+			`📞 Телефон: ${booking.client_phone}\n` +
+			`📋 Услуга: ${booking.service}\n` +
+			`📅 Дата: ${formatDateForDisplay(booking.date)}\n` +
+			`🕐 Время: ${booking.time}\n` +
+			`⏱️ Длительность: ${booking.duration} мин\n` +
+			`💰 Цена: ${booking.price} тг\n\n` +
+			`Ждём клиента в салоне! ✨`
+
+		// Отправляем WhatsApp сообщение мастеру
+		const masterJid = `${masterContact.phone}@c.us`
+		await sock.sendMessage(masterJid, { text: message })
+
+		console.log(`✅ Уведомление отправлено мастеру ${booking.master} (${masterContact.phone})`)
+	} catch (error) {
+		console.error(`❌ Ошибка отправки уведомления мастеру:`, error)
+	}
+}
 
 // ===================== BOT STATE MANAGEMENT =====================
 // Global state for bot control via Telegram
@@ -865,6 +939,9 @@ const botState = {
 	startTime: null,
 	stopTime: null
 }
+
+// Reminder service instance
+let reminderService = null
 
 // ===================== TELEGRAM BOT CONTROL =====================
 const { initTelegramBot } = require('./utils/telegram-bot')
@@ -2201,7 +2278,7 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 
 ТВОЙ ОТВЕТ:`
 
-		METRICS.gemini_calls++
+		metrics.gemini_calls++
 		const result = await generativeModel.generateContent(fullPrompt)
 	
 		// Проверка на корректность ответа Gemini
@@ -2326,9 +2403,10 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 					
 					const scheduleInfo = `\n\n📅 Свободные окошки у мастера ${masterName.trim()} на ${formatDateForDisplay(date)}:\n${slotsText}\n\n(это для услуг продолжительностью до 60 минут)\n\nЧтобы записаться, выберите услугу из списка! ✨`;
 					
-					response = response.replace(/ПОКАЗАТЬ_РАСПИСАНИЕ:.+/, scheduleInfo);
+					// Remove the command and everything after it to prevent duplication
+					response = response.replace(/ПОКАЗАТЬ_РАСПИСАНИЕ:[\s\S]*$/, scheduleInfo);
 				} else {
-					response = response.replace(/ПОКАЗАТЬ_РАСПИСАНИЕ:.+/, `\n\n😔 К сожалению, у мастера ${masterName.trim()} на ${formatDateForDisplay(date)} все занято. Попробуйте другую дату!`);
+					response = response.replace(/ПОКАЗАТЬ_РАСПИСАНИЕ:[\s\S]*$/, `\n\n😔 К сожалению, у мастера ${masterName.trim()} на ${formatDateForDisplay(date)} все занято. Попробуйте другую дату!`);
 				}
 				
 				console.log(`✅ Расписание обработано`);
@@ -2406,13 +2484,13 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 			await replyMessage(sock, msg, response)
 		}
 	} catch (error) {
-		METRICS.gemini_errors++
+		metrics.gemini_errors++
 		console.error('❌ Ошибка генерации ответа Gemini:', error.message)
 		
 		// Отправляем уведомление если ошибок слишком много (например 3 подряд)
-		if (METRICS.gemini_errors % 5 === 0) {
+		if (metrics.gemini_errors % 5 === 0) {
 			await sendTelegramAlert('error', 'Частые ошибки Gemini API', {
-				total_errors: METRICS.gemini_errors,
+				total_errors: metrics.gemini_errors,
 				last_error: error.message
 			}, CONFIG.TELEGRAM_ALERT_BOT_TOKEN, CONFIG.TELEGRAM_ADMIN_CHAT_ID)
 		}
@@ -2549,15 +2627,9 @@ ${servicesInfo}
    Клиент: "какое время свободно у Юны сегодня?"
    Ты: "Сейчас проверю свободное время! ПОКАЗАТЬ_РАСПИСАНИЕ: мастер=Юна, дата=${today}"
    
-   После получения списка времени, покажи его и уточни услугу:
-   "Вот свободные окошки у Юны на сегодня:
-   • 10:00
-   • 14:00  
-   • 16:00
-   
-   (это для услуг продолжительностью до 60 минут)
-   
-   Какую услугу вы хотели бы сделать?"
+   ВАЖНО: НЕ ДОБАВЛЯЙ НИКАКОЙ ТЕКСТ ПОСЛЕ команды ПОКАЗАТЬ_РАСПИСАНИЕ!
+   Система автоматически заменит команду на красивый список времени.
+   Просто напиши команду и всё - больше ничего не нужно!
 
 4. ТОЛЬКО ПОСЛЕ ВЫБОРА КОНКРЕТНОЙ УСЛУГИ - проверяй время:
    - Когда клиент выбрал КОНКРЕТНУЮ услугу И указал время - добавь команду:
@@ -3349,7 +3421,7 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 		}
 
 		console.log(`\n✅ ===== ЗАПИСЬ #${bookingId} УСПЕШНО СОЗДАНА =====\n`)
-		METRICS.bookings_created++
+		metrics.bookings_created++
 
 	} catch (error) {
 		if (client) {
@@ -3360,7 +3432,7 @@ async function initiateBookingConfirmation(msg, sock, conversation, bookingData)
 		console.error('❌ Ошибка создания записи:', error)
 		console.error('Детали ошибки:', error.stack)
 		
-		METRICS.bookings_failed++
+		metrics.bookings_failed++
 		await replyMessage(sock, msg, 
 			'Произошла ошибка при создании записи. Пожалуйста, попробуйте еще раз или свяжитесь с администратором.'
 		)
@@ -3933,7 +4005,14 @@ async function startBot() {
 
 	await initWhatsApp()
 
-	// Запуск системы напоминаний
+	// Запуск системы напоминаний о записях
+	if (botState.sock) {
+		reminderService = new ReminderService(pool, botState.sock, MASTER_CONTACTS, CONFIG)
+		reminderService.start()
+		console.log('✅ Reminder service initialized')
+	}
+	
+	// Запуск очистки старых сессий
 	startSessionCleanup()
 	
 	// Alert start

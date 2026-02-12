@@ -6,14 +6,13 @@ const fs = require('fs');
 const path = require('path');
 
 // Маппинг мастеров на их календари
-// Добавляйте новых мастеров по мере необходимости
+// ВАЖНО: Календарные события создаются ТОЛЬКО в основном календаре из .env
+// Все мастера получают уведомления через WhatsApp
+// Индивидуальные календари мастеров можно добавить после настройки доступа
 const MASTER_CALENDARS = {
-  'Айгерим': process.env.CALENDAR_AIGERIM || null,
-  'Юна': process.env.CALENDAR_YUNA || null,
-  'Аружан': process.env.CALENDAR_АРУЖАН || null,
-  'Гульназ': process.env.CALENDAR_ГУЛЬНАЗ || null,
-  'Жазира': process.env.CALENDAR_ЖАЗИРА || null,
-  'Лена': process.env.CALENDAR_ЛЕНА || null,
+  // 'Юна': process.env.CALENDAR_YUNA || 'Yunakhairullina13@gmail.com', // Отключено - нет доступа
+  // Остальные мастера не имеют календарной интеграции
+  // Они получают уведомления только через WhatsApp
 };
 
 // Инициализация Google Calendar API клиента
@@ -128,10 +127,14 @@ async function addToCalendar(booking) {
 
   try {
     // Получаем email календаря мастера
-    const calendarEmail = getCalendarEmail(master);
+    const masterCalendarEmail = getCalendarEmail(master);
     
-    if (!calendarEmail) {
-      console.log(`ℹ️ Google Calendar не настроен для мастера "${master}". Бронирование #${id} создано без календаря.`);
+    // Получаем основной календарь салона из .env
+    const mainCalendarEmail = process.env.CALENDAR_ID;
+    
+    // Проверяем наличие хотя бы одного календаря
+    if (!masterCalendarEmail && !mainCalendarEmail) {
+      console.log(`ℹ️ Google Calendar не настроен для мастера "${master}" и основной календарь не указан. Бронирование #${id} создано без календаря.`);
       return null;
     }
 
@@ -172,16 +175,39 @@ async function addToCalendar(booking) {
       },
     };
 
-    console.log(`📅 Создаем событие в календаре ${calendarEmail} для бронирования #${id}...`);
+    let eventId = null;
+    
+    // Создаем событие в календаре мастера (если есть)
+    if (masterCalendarEmail) {
+      console.log(`📅 Создаем событие в календаре мастера ${masterCalendarEmail} для бронирования #${id}...`);
 
-    const response = await calendar.events.insert({
-      calendarId: calendarEmail,
-      resource: event,
-    });
+      const masterResponse = await calendar.events.insert({
+        calendarId: masterCalendarEmail,
+        resource: event,
+      });
 
-    const eventId = response.data.id;
-    console.log(`✅ Событие создано в Google Calendar: ${eventId}`);
-    console.log(`   📧 Календарь: ${calendarEmail}`);
+      eventId = masterResponse.data.id;
+      console.log(`✅ Событие создано в календаре мастера: ${eventId}`);
+      console.log(`   📧 Календарь мастера: ${masterCalendarEmail}`);
+    }
+    
+    // ВСЕГДА создаем событие в основном календаре салона (если настроен)
+    if (mainCalendarEmail && mainCalendarEmail !== masterCalendarEmail) {
+      console.log(`📅 Создаем событие в основном календаре салона ${mainCalendarEmail}...`);
+      
+      try {
+        const mainResponse = await calendar.events.insert({
+          calendarId: mainCalendarEmail,
+          resource: event,
+        });
+        
+        console.log(`✅ Событие создано в основном календаре: ${mainResponse.data.id}`);
+      } catch (mainError) {
+        console.error(`⚠️ Ошибка создания в основном календаре:`, mainError.message);
+        // Не останавливаем процесс, если основной календарь не работает
+      }
+    }
+    
     console.log(`   👤 Клиент: ${client_name}`);
     console.log(`   📅 Дата: ${date} ${time}`);
 
