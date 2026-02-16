@@ -21,6 +21,11 @@ const metrics = require('./lib/metrics')
 const alerts = require('./lib/alerts')
 const health = require('./lib/health')
 
+// ===================== OPTIMIZATION MODULES =====================
+const { SimpleCache, QUICK_RESPONSES } = require('./cache')
+const { retryWithBackoff } = require('./retry-helper')
+const RateLimiter = require('./rate-limiter')
+
 
 
 // ===================== ГЛОБАЛЬНОЕ ПОДАВЛЕНИЕ ОШИБОК WHATSAPP =====================
@@ -1029,7 +1034,21 @@ if (CONFIG.TELEGRAM_ALERT_BOT_TOKEN && CONFIG.TELEGRAM_ADMIN_CHAT_ID) {
 const pool = new Pool({
 	connectionString: CONFIG.DATABASE_URL,
 	ssl: false,
+	max: 3, // Оптимизация: уменьшаем с 10 до 3 для экономии памяти
+	connectionTimeoutMillis: 30000, // 30 секунд
 })
+
+// ===================== OPTIMIZATION INSTANCES =====================
+// Кэш для ответов (max 100 записей, TTL 1 час)
+const responseCache = new SimpleCache(100, 3600000)
+
+// Rate limiter (10 сообщений в минуту на пользователя)
+const rateLimiter = new RateLimiter(10, 60000)
+
+// Периодическая очистка rate limiter
+setInterval(() => {
+	rateLimiter.cleanup()
+}, 5 * 60 * 1000) // Каждые 5 минут
 
 // Тест подключения
 pool.on('connect', () => {
@@ -1309,7 +1328,7 @@ function initVertexAI() {
 		})
 
 		generativeModel = vertexAI.getGenerativeModel({
-			model: 'gemini-2.5-flash',
+			model: 'gemini-1.5-flash', // Оптимизация: 1.5-flash быстрее и экономичнее чем 2.5
 		})
 
 		console.log('✅ Vertex AI инициализирован (US region, обход блокировки КЗ)')
@@ -2294,10 +2313,44 @@ async function sendGreeting(msg, sock) {
 // Генерация ответа с Gemini AI
 async function generateAndSendResponse(msg, conversation, sock) {
 	try {
+		const lastUserMessage = conversation.history[conversation.history.length - 1]?.content || ''
+
+		// 1. ОПТИМИЗАЦИЯ: Проверка быстрых ответов на частые вопросы (без API)
+		const quickResponse = QUICK_RESPONSES.match(lastUserMessage)
+		if (quickResponse) {
+			console.log('💨 Быстрый ответ из шаблонов (без Gemini API)')
+			
+			conversation.history.push({
+				role: 'assistant',
+				content: quickResponse,
+				timestamp: new Date().toISOString(),
+			})
+			await saveConversation(conversation)
+			
+			return await replyMessage(sock, msg, quickResponse)
+		}
+
+		// 2. ОПТИМИЗАЦИЯ: Проверка кэша
+		const cached = responseCache.get(lastUserMessage)
+		if (cached) {
+			console.log('📦 Ответ взят из кэша (без Gemini API)')
+			
+			conversation.history.push({
+				role: 'assistant',
+				content: cached,
+				timestamp: new Date().toISOString(),
+			})
+			await saveConversation(conversation)
+			
+			return await replyMessage(sock, msg, cached)
+		}
+
 		const systemPrompt = createSystemPrompt(conversation.client_name)
-		const chatHistory = conversation.history.slice(-10).map(msg => ({
+		
+		// ОПТИМИЗАЦИЯ: Уменьшаем историю с 10 до 5 сообщений
+		const chatHistory = conversation.history.slice(-5).map(msg => ({
 			role: msg.role === 'user' ? 'user' : 'model',
-			parts: [{ text: msg.content }],
+			parts: [{ text: msg.content.substring(0, 500) }], // ОПТИМИЗАЦИЯ: Лимит 500 символов
 		}))
 
 		// Формируем полный промпт с историей для Vertex AI
@@ -2309,12 +2362,24 @@ ${chatHistory
 	.join('\n')}
 
 НОВОЕ СООБЩЕНИЕ КЛИЕНТА:
-${conversation.history[conversation.history.length - 1]?.content || ''}
+${lastUserMessage}
 
 ТВОЙ ОТВЕТ:`
 
 		metrics.gemini_calls++
-		const result = await generativeModel.generateContent(fullPrompt)
+		
+		// 3. ОПТИМИЗАЦИЯ: Retry logic с exponential backoff
+		console.log('🤖 Вызов Gemini API с retry logic...')
+		const result = await retryWithBackoff(
+			async () => {
+				return await generativeModel.generateContent(fullPrompt)
+			},
+			{
+				maxRetries: 3,
+				initialDelay: 1000,
+				maxDelay: 10000
+			}
+		)
 	
 		// Проверка на корректность ответа Gemini
 		if (!result.response?.candidates?.[0]?.content?.parts?.[0]?.text) {
@@ -2448,6 +2513,9 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 			}
 		}
 
+		// 4. ОПТИМИЗАЦИЯ: Кэшируем успешный ответ (для будущих запросов)
+		responseCache.set(lastUserMessage, response)
+
 		conversation.history.push({
 			role: 'assistant',
 			content: response,
@@ -2530,84 +2598,49 @@ ${conversation.history[conversation.history.length - 1]?.content || ''}
 			}, CONFIG.TELEGRAM_ALERT_BOT_TOKEN, CONFIG.TELEGRAM_ADMIN_CHAT_ID)
 		}
 
-		const fallbackMessage = `Извините, сейчас я немного перегружена технически 😔\n\nПожалуйста, попробуйте написать через минуту или позвоните нам прямо в салон! ✨\n\nМы очень ждем вас в ${CONFIG.SALON_NAME} 🤍`
+		// ОПТИМИЗАЦИЯ: Дружелюбное сообщение без технических деталей
+		// После 3 retry попыток - предлагаем альтернативный способ связи
+		const fallbackMessage = `Приношу извинения! 🤍\n\nСейчас немного загружена, но я обязательно помогу вам с записью!\n\nВы можете:\n• Написать через минуту - я с радостью вам отвечу ✨\n• Позвонить прямо в салон\n\nМы очень ждем вас в ${CONFIG.SALON_NAME}! 💅`
 		
 		return await replyMessage(sock, msg, fallbackMessage)
 	}
 }
 // ===================== СОЗДАНИЕ СИСТЕМНОГО ПРОМПТА С ДАТАМИ =====================
 function createSystemPrompt(clientName) {
-	const mastersInfo = SALON_DATA.masters
-		.map(m => `${m.name} - ${m.specialty}`)
-		.join('\n')
-
-	// Группируем услуги по мастерам для более читаемого формата
-	const yunaServices = SALON_DATA.services
-		.filter(s => s.master === 'Юна')
-		.map(s => `  ${s.name} - ${s.price} тг`)
-		.join('\n')
-
-	const otherMastersServices = SALON_DATA.services
-		.filter(s => s.master === 'другие' && s.category === 'маникюр')
-		.map(s => `  ${s.name} - ${s.price} тг`)
-		.join('\n')
-
-	const lenaServices = SALON_DATA.services
-		.filter(s => s.master === 'Лена')
-		.map(s => `  ${s.name} - ${s.price} тг`)
-		.join('\n')
-
-	const servicesInfo = `МАНИКЮР
-
-Мастер Юна (главный мастер):
-${yunaServices}
-
-Мастера: Аружан, Айгерим, Гульназ, Жазира
-${otherMastersServices}
-
-БРОВИ, РЕСНИЦЫ И ШУГАРИНГ
-
-Мастер Лена:
-${lenaServices}`
-
 	// Получаем ближайшие даты
 	const today = getToday()
 	const tomorrow = getTomorrow()
 	const todayDisplay = formatDateForDisplay(today)
 	const tomorrowDisplay = formatDateForDisplay(tomorrow)
-	const nextDays = getNextDays(5)
-		.map(d => `${d.display} (${d.dayName})`)
-		.join(', ')
 
-	return `Ты - виртуальный администратор салона красоты "${CONFIG.SALON_NAME}".
+	// ОПТИМИЗАЦИЯ: Упрощенный промпт без детальных списков услуг
+	return `Ты - администратор салона "${CONFIG.SALON_NAME}".
 
-ТВОЯ РОЛЬ:
-- Дружелюбный, милый и приветливый помощник
-- Твоя цель: помочь клиенту выбрать услугу, показать цены, и затем помочь с записью
-- Обращайся к клиенту по имени: ${clientName || 'клиент'}
-- Пиши естественно и тепло, используй эмодзи умеренно (✨, 💅, 🤍)
-- КРИТИЧЕСКИ ВАЖНО: НИКОГДА не используй markdown форматирование - НЕ используй звездочки, жирный текст, подчеркивания
-- Пиши обычным текстом без форматирования
-- Общайся приветливо, но не перегружай сообщения
+РОЛЬ:
+- Помогай клиенту записаться на услугу
+- Обращайся по имени: ${clientName || 'клиент'}
+- Пиши тепло, используй эмодзи (✨, 💅, 🤍)
+- НЕ используй markdown (звездочки, жирный текст)
 
-ИНФОРМАЦИЯ О САЛОНЕ:
-Режим работы: ${SALON_DATA.workingHours}
+САЛОН:
+Режим: ${SALON_DATA.workingHours}
 Адрес: ${SALON_DATA.address}
-Instagram: ${CONFIG.INSTAGRAM_LINK}
 
-ТЕКУЩАЯ ДАТА:
+ДАТЫ:
 Сегодня: ${todayDisplay}
 Завтра: ${tomorrowDisplay}
 
-НАШИ МАСТЕРА:
-${mastersInfo}
+МАСТЕРА:
+• Юна (главный мастер по маникюру)
+• Аружан, Айгерим, Гульназ, Жазира (мастера по маникюру)  
+• Лена (брови, ресницы, шугаринг)
 
-УСЛУГИ И ЦЕНЫ:
-${servicesInfo}
+ОСНОВНЫЕ ЦЕНЫ:
+Маникюр Юна: 3000-10000 тг
+Маникюр другие: 1000-5000 тг
+Ресницы/брови: 1500-8000 тг
 
-МАТЕРИАЛЫ: ${SALON_DATA.materialInfo}
-
-ГЛАВНЫЕ ПРАВИЛА ОБЩЕНИЯ:
+ПРАВИЛА:
 
 1. ВСЕГДА УТОЧНЯЙ КОНКРЕТНУЮ УСЛУГУ И ПОКАЗЫВАЙ ЦЕНЫ:
    
